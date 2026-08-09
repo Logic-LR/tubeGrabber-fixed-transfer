@@ -1,62 +1,8 @@
-# ── Python ──
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-.Python
-*.egg-info/
-.eggs/
-dist/
-build/
-*.egg
-
-# 虚拟环境
 .venv/
-venv/
-env/
-
-# ── 测试 / 类型 / 工具 ──
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-htmlcov/
-.hypothesis/
-
-# ── IDE / 编辑器 ──
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-.project
-.pydevproject
-
-# Cursor（本地会话，不入库）
-.cursor/
-
-# ── 系统文件 ──
-.DS_Store
-Thumbs.db
-desktop.ini
-
-# ── 日志与临时文件 ──
-*.log
-*.tmp
-*.bak
-Log/
-
-# ── 本地数据（运行时生成或体积大，不入库）──
-
-data/captures/
-
-# 离线标注、调查图等
-survey_*.jpg
-survey_*.png
-slot_map_*.png
-
-# ── 环境与密钥 ──
-.env
-.env.*
-*.pem
-secrets.yaml
+artifacts/*
+!artifacts/.gitkeep
+models/*.pt
+!models/.gitkeep
+training/tube_slots.yaml

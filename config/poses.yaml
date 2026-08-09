@@ -1,0 +1,11 @@
+# These values come from the current right-arm configuration.
+# Verify them at low speed before enabling physical manipulation.
+
+observation_pose:
+  position_mm: [87.058, 308.970, -172.253]
+  rpy_rad: [-3.073, -0.031, -1.607]
+  confirmed: false
+
+# Separate manipulation posture. This provisional value points tool +Z toward
+# base -Z while preserving the current wrist yaw. Verify it at low speed.
+vertical_tool_rpy_rad: [-3.141593, 0.0, -1.607]

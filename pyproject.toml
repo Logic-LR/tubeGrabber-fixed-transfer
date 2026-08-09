@@ -1,0 +1,26 @@
+[project]
+name = "tube-grabber"
+version = "0.1.0"
+description = "Final runtime for vision-guided test-tube rack manipulation."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24,<3",
+    "opencv-python>=4.8,<5",
+    "PyYAML>=6.0,<7",
+]
+
+[project.optional-dependencies]
+vision = ["ultralytics>=8.3,<9"]
+realsense = ["pyrealsense2>=2.55,<3"]
+agent = ["google-genai>=2.13,<3"]
+
+[project.scripts]
+tube-grabber = "tube_grabber.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["tube_grabber*"]

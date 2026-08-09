@@ -1,18 +1,12 @@
-# eye-in-hand 手眼标定（Tsai，20 组样本）
-# matrix_name: T_cam2gripper — 将点从相机坐标系变换到夹爪/末端坐标系
-#   P_gripper = T_cam2gripper @ P_cam
-# 代码中 T_ee_cam 与此矩阵相同（ee = 机械臂法兰）
-# 视觉 base_xyz 为夹爪 TCP 抓取目标；运动规划用 gripper.tcp_offset_mm 换算法兰位姿
-# 平移单位：米（m）；使用时若臂 pose 为 mm，需统一单位
+# D435 right-wrist camera -> right arm flange.
+# Translation has been converted from the validated local config to mm.
 
-mode: eye_in_hand
-method: tsai
-num_samples: 20
-matrix_name: T_cam2gripper
-translation_unit: m
+source_frame: camera_rightwrist
+target_frame: end_right
+translation_unit: mm
 
-T_ee_cam:
-  - [-0.01810741383813763, 0.9998352295753283, -0.0012787744698926715, -0.13016673504906737]
-  - [-0.9998235625920535, -0.018113564447340913, -0.004974180208448205, 0.02262328388058501]
-  - [-0.004996523774436881, 0.0011884793067000105, 0.9999868110465802, 0.05375258130563079]
+matrix:
+  - [0.005539677, 0.999718374, -0.023075644, -84.423838]
+  - [-0.999984392, 0.005554952, 0.000597902, 41.327457]
+  - [0.000725918, 0.023071971, 0.999733543, -36.106544]
   - [0.0, 0.0, 0.0, 1.0]

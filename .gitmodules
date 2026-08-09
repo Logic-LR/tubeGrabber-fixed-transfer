@@ -1,3 +1,0 @@
-[submodule "calib/rm65b-handeye-calibration"]
-	path = calib/rm65b-handeye-calibration
-	url = https://github.com/surf26/rm65b-handeye-calibration.git
