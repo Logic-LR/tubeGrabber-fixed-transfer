@@ -6,3 +6,6 @@ artifacts/*
 models/*.pt
 !models/.gitkeep
 training/tube_slots.yaml
+training/rack_pose.yaml
+datasets/
+runs/

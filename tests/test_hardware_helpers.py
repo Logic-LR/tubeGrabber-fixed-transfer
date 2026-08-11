@@ -30,18 +30,39 @@ class _FakeArm:
     class Robot:
         def __init__(self) -> None:
             self.calls: list[tuple] = []
+            self.position = 170
+            self.mode = 3
+            self.current_force = 10
 
-        def rm_set_tool_voltage(self, value: int) -> int:
-            self.calls.append(("voltage", value))
+        def rm_set_gripper_position(
+            self,
+            position: int,
+            block: bool,
+            timeout: int,
+        ) -> int:
+            self.calls.append(("gripper_position", position, block, timeout))
+            if position == 135:
+                # A real tube can stop the jaws before the requested position.
+                self.position = 150
+                self.mode = 6
+                self.current_force = 200
+            else:
+                self.position = position
+                self.mode = 3
+                self.current_force = 10
             return 0
 
-        def rm_set_rm_plus_mode(self, value: int) -> tuple[int, str]:
-            self.calls.append(("mode", value))
-            return 0, "ok"
-
-        def rm_set_gripper_position(self, position: int, block: bool, timeout: int) -> int:
-            self.calls.append(("position", position, block, timeout))
-            return 0
+        def rm_get_gripper_state(self) -> tuple[int, dict]:
+            self.calls.append(("state",))
+            return 0, {
+                "enable_state": 1,
+                "status": 1,
+                "error": 0,
+                "mode": self.mode,
+                "current_force": self.current_force,
+                "temperature": 30,
+                "actpos": self.position,
+            }
 
     def __init__(self) -> None:
         self.sdk_robot = self.Robot()
@@ -64,6 +85,14 @@ class _FakeRobot:
         self.calls.append(("tool_frame", name))
         return 0, "ok"
 
+    def rm_get_current_work_frame(self) -> tuple[int, dict]:
+        self.calls.append(("get_work_frame",))
+        return 0, {"frame_name": "Base"}
+
+    def rm_get_current_tool_frame(self) -> tuple[int, dict]:
+        self.calls.append(("get_tool_frame",))
+        return 0, {"frame_name": "Arm_Tip"}
+
     def rm_get_current_arm_state(self) -> tuple[int, dict]:
         self.calls.append(("get_pose",))
         return 0, {"pose": [0.1, 0.2, 0.3, 1.0, 2.0, 3.0]}
@@ -79,6 +108,18 @@ class _FakeRobot:
     def rm_get_arm_power_state(self) -> tuple[int, int]:
         self.calls.append(("power_state",))
         return 0, 1
+
+    def rm_get_controller_state(self) -> dict:
+        self.calls.append(("controller_state",))
+        return {"return_code": 0, "sys_err": 0}
+
+    def rm_get_joint_err_flag(self) -> dict:
+        self.calls.append(("joint_errors",))
+        return {
+            "return_code": 0,
+            "err_flag": [0] * 7,
+            "brake_state": [1] * 7,
+        }
 
     def rm_movej_p(self, *args: object) -> tuple[int, str]:
         self.calls.append(("movej_p", *args))
@@ -137,11 +178,16 @@ class HardwareHelpersTest(unittest.TestCase):
             rm_thread_mode_e=SimpleNamespace(RM_TRIPLE_MODE_E=3),
         )
         with patch("tube_grabber.hardware.realman_arm.import_module", return_value=sdk):
-            arm = RealManArm("169.254.128.19", work_frame="Base")
+            arm = RealManArm(
+                "169.254.128.19",
+                work_frame="Base",
+                reject_conflicting_processes=False,
+            )
             arm.connect()
             self.assertEqual(arm.dof, 7)
             self.assertEqual(arm.get_run_mode(), 1)
             self.assertEqual(arm.get_power_state(), 1)
+            arm.require_healthy()
             arm.move_pose(Pose6D(100.0, 200.0, 300.0, 1.0, 2.0, 3.0), 5)
             arm.move_pose(
                 Pose6D(110.0, 200.0, 300.0, 1.0, 2.0, 3.0),
@@ -152,6 +198,8 @@ class HardwareHelpersTest(unittest.TestCase):
 
         self.assertIn(("work_frame", "Base"), robot.calls)
         self.assertIn(("tool_frame", "Arm_Tip"), robot.calls)
+        self.assertIn(("controller_state",), robot.calls)
+        self.assertIn(("joint_errors",), robot.calls)
         self.assertIn(
             ("movej_p", [0.1, 0.2, 0.3, 1.0, 2.0, 3.0], 5, 0, 0, 1),
             robot.calls,
@@ -186,7 +234,7 @@ class HardwareHelpersTest(unittest.TestCase):
         with self.assertRaisesRegex(HardwareError, "暂不支持"):
             _read_color_intrinsics(frame)
 
-    def test_gripper_uses_only_rm_plus_position_api(self) -> None:
+    def test_gripper_uses_two_finger_position_and_feedback(self) -> None:
         arm = _FakeArm()
         gripper = RealManGripper(arm)  # type: ignore[arg-type]
         with patch("tube_grabber.hardware.realman_gripper.time.sleep"):
@@ -195,17 +243,13 @@ class HardwareHelpersTest(unittest.TestCase):
             gripper.grip()
             gripper.release()
             gripper.reset()
-        self.assertEqual(
-            arm.sdk_robot.calls,
-            [
-                ("voltage", 3),
-                ("mode", 9600),
-                ("position", 170, True, 5),
-                ("position", 135, True, 5),
-                ("position", 170, True, 5),
-                ("position", 1, True, 5),
-            ],
-        )
+        calls = arm.sdk_robot.calls
+        self.assertEqual(calls[0], ("state",))
+        commanded = [call for call in calls if call[0] == "gripper_position"]
+        self.assertEqual([call[1] for call in commanded], [170, 135, 170, 1])
+        self.assertTrue(all(call[2:] == (True, 5) for call in commanded))
+        self.assertNotIn("follow_position", [call[0] for call in calls])
+        self.assertGreaterEqual(sum(call[0] == "state" for call in calls), 13)
 
 
 if __name__ == "__main__":

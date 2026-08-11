@@ -17,6 +17,11 @@ from tube_grabber.workflow import PreparedTransfer
 def format_observation(observation: RackObservation) -> str:
     lines = [
         f"rack={observation.rack_id}  plane_z={observation.plane_z_mm:.2f} mm",
+        (
+            f"stable_frames={observation.stability_frame_count}  "
+            f"keypoint_spread={observation.maximum_keypoint_spread_px:.2f}px  "
+            f"position_spread={observation.maximum_position_spread_mm:.2f}mm"
+        ),
     ]
     for row in (1, 2):
         cells = []
@@ -157,25 +162,37 @@ def save_observation_image(
             1,
             cv2.LINE_AA,
         )
-    marker = (int(round(observation.marker.u)), int(round(observation.marker.v)))
-    cv2.drawMarker(
-        image,
-        marker,
-        (255, 0, 255),
-        cv2.MARKER_CROSS,
-        20,
-        2,
+    keypoint_names = (
+        "k0",
+        "k1",
+        "k2",
+        "k3",
+        "screw_k0",
+        "screw_k1",
+        "screw_k2",
+        "screw_k3",
     )
-    cv2.putText(
-        image,
-        "K0",
-        (marker[0] + 8, marker[1] - 8),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.55,
-        (255, 0, 255),
-        2,
-        cv2.LINE_AA,
-    )
+    keypoints = observation.rack_keypoints or (observation.marker,)
+    for name, point in zip(keypoint_names, keypoints):
+        center = (int(round(point.u)), int(round(point.v)))
+        cv2.drawMarker(
+            image,
+            center,
+            (255, 0, 255),
+            cv2.MARKER_CROSS,
+            18,
+            2,
+        )
+        cv2.putText(
+            image,
+            name,
+            (center[0] + 7, center[1] - 7),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (255, 0, 255),
+            1,
+            cv2.LINE_AA,
+        )
     _write_image(path, image)
     return path
 

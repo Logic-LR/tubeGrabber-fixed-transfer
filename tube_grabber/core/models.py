@@ -204,12 +204,30 @@ class RackObservation:
     plane_z_mm: float
     slots: tuple[SlotObservation, ...]
     timestamp_ms: float
+    rack_keypoints: tuple[Pixel, ...] = ()
+    stability_frame_count: int = 1
+    maximum_keypoint_spread_px: float = 0.0
+    maximum_position_spread_mm: float = 0.0
 
     def __post_init__(self) -> None:
         if not self.rack_id:
             raise ValueError("rack_id cannot be empty")
         if not _finite(self.plane_z_mm, self.timestamp_ms):
             raise ValueError("rack observation values must be finite")
+        if self.stability_frame_count <= 0:
+            raise ValueError("stability_frame_count must be positive")
+        if not _finite(
+            self.maximum_keypoint_spread_px,
+            self.maximum_position_spread_mm,
+        ):
+            raise ValueError("rack stability values must be finite")
+        if (
+            self.maximum_keypoint_spread_px < 0.0
+            or self.maximum_position_spread_mm < 0.0
+        ):
+            raise ValueError("rack stability values cannot be negative")
+        if self.rack_keypoints and len(self.rack_keypoints) != 8:
+            raise ValueError("rack_keypoints must be empty or contain eight points")
         if len(self.slots) != 12:
             raise ValueError("a 2x6 rack observation must contain 12 slots")
         addresses = [slot.address for slot in self.slots]

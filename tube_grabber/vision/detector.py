@@ -15,11 +15,11 @@ from tube_grabber.core.errors import VisionError
 from tube_grabber.core.models import Box, Detection
 
 
-EXPECTED_CLASSES = {0: "empty_hole", 1: "tube_cap"}
+EXPECTED_CLASSES = {0: "tube_cap"}
 
 
-class YoloDetector:
-    """Run one object-detection model with exactly two supported classes."""
+class YoloCapDetector:
+    """Run the one-class tube-cap detector used by the final runtime."""
 
     def __init__(
         self,
@@ -33,7 +33,7 @@ class YoloDetector:
         normalized_names = {int(key): str(value) for key, value in class_names.items()}
         if normalized_names != EXPECTED_CLASSES:
             raise VisionError(
-                "YOLO classes must be {0: 'empty_hole', 1: 'tube_cap'}"
+                f"YOLO classes must be {EXPECTED_CLASSES}"
             )
         if not 0.0 < confidence <= 1.0:
             raise VisionError("YOLO confidence must be between 0 and 1")

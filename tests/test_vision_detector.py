@@ -8,7 +8,7 @@ from unittest.mock import patch
 import numpy as np
 
 from tube_grabber.core.errors import VisionError
-from tube_grabber.vision.detector import YoloDetector
+from tube_grabber.vision.detector import YoloCapDetector
 
 
 class _Scalar:
@@ -25,7 +25,7 @@ class _Row:
 
 
 class _Boxes:
-    cls = [_Scalar(1)]
+    cls = [_Scalar(0)]
     conf = [_Scalar(0.91)]
     xyxy = [_Row()]
 
@@ -38,17 +38,17 @@ class _Result:
 
 
 class _Model:
-    names = {0: "empty_hole", 1: "tube_cap"}
+    names = {0: "tube_cap"}
 
     def predict(self, **kwargs: object) -> list[_Result]:
         return [_Result()]
 
 
-class YoloDetectorTests(unittest.TestCase):
+class YoloCapDetectorTests(unittest.TestCase):
     def test_model_import_and_load_are_lazy(self) -> None:
-        detector = YoloDetector(
+        detector = YoloCapDetector(
             "model_does_not_need_to_exist_yet.pt",
-            {0: "empty_hole", 1: "tube_cap"},
+            {0: "tube_cap"},
             0.45,
             0.45,
             1280,
@@ -67,9 +67,9 @@ class YoloDetectorTests(unittest.TestCase):
 
     def test_wrong_class_contract_is_rejected(self) -> None:
         with self.assertRaisesRegex(VisionError, "YOLO classes"):
-            YoloDetector(
+            YoloCapDetector(
                 "model.pt",
-                {0: "empty", 1: "tube"},
+                {0: "cap"},
                 0.45,
                 0.45,
                 1280,

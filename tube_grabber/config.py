@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import math
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 from tube_grabber.core.errors import ConfigError
+from tube_grabber.vision.rack_calibration import RackCircleFitConfig
+from tube_grabber.vision.rack_pose import RACK_KEYPOINT_NAMES
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -37,7 +38,6 @@ def load_config(path: str | Path = "config/app.yaml") -> dict[str, Any]:
         "arm",
         "gripper",
         "vision",
-        "markers",
         "racks",
         "geometry",
         "motion",
@@ -60,9 +60,69 @@ def load_config(path: str | Path = "config/app.yaml") -> dict[str, Any]:
         if not str(agent.get("api_key_env", "")).strip():
             raise ConfigError("agent.api_key_env cannot be empty for Gemini")
 
-    class_names = data["vision"].get("class_names")
-    if class_names not in ({0: "empty_hole", 1: "tube_cap"}, {"0": "empty_hole", "1": "tube_cap"}):
-        raise ConfigError("vision.class_names must define empty_hole and tube_cap")
+    vision = data["vision"]
+    for subsection in (
+        "cap",
+        "rack_pose",
+        "calibration",
+        "stability",
+        "plane",
+        "matching",
+    ):
+        if not isinstance(vision.get(subsection), dict):
+            raise ConfigError(f"vision.{subsection} must be a mapping")
+    device = str(vision.get("device", "")).strip()
+    try:
+        device_index = int(device)
+    except ValueError as error:
+        raise ConfigError(
+            "vision.device must be a local CUDA device index such as '0'"
+        ) from error
+    if device_index < 0 or device != str(device_index):
+        raise ConfigError(
+            "vision.device must be a local CUDA device index such as '0'"
+        )
+    cap_names = vision["cap"].get("class_names")
+    if cap_names not in ({0: "tube_cap"}, {"0": "tube_cap"}):
+        raise ConfigError("vision.cap.class_names must be {0: tube_cap}")
+    pose_names = vision["rack_pose"].get("class_names")
+    if pose_names not in ({0: "rack_surface"}, {"0": "rack_surface"}):
+        raise ConfigError(
+            "vision.rack_pose.class_names must be {0: rack_surface}"
+        )
+    keypoint_names = tuple(
+        str(value) for value in vision["rack_pose"].get("keypoint_names", ())
+    )
+    if keypoint_names != RACK_KEYPOINT_NAMES:
+        raise ConfigError(
+            "vision.rack_pose.keypoint_names must be k0..k3 then screw_k0..screw_k3"
+        )
+    if not isinstance(vision["rack_pose"].get("k0_red_marker"), dict):
+        raise ConfigError("vision.rack_pose.k0_red_marker must be a mapping")
+    circle = vision["calibration"]
+    try:
+        RackCircleFitConfig(
+            search_radius_px=int(circle["search_radius_px"]),
+            minimum_radius_px=int(circle["minimum_radius_px"]),
+            maximum_radius_px=int(circle["maximum_radius_px"]),
+            default_radius_px=int(circle["default_radius_px"]),
+            hough_dp=float(circle["hough_dp"]),
+            hough_min_distance_px=float(circle["hough_min_distance_px"]),
+            hough_edge_threshold=float(circle["hough_edge_threshold"]),
+            hough_accumulator_threshold=float(
+                circle["hough_accumulator_threshold"]
+            ),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ConfigError(f"vision.calibration is invalid: {error}") from error
+    capture_frames = int(vision["stability"].get("capture_frames", 0))
+    minimum_inliers = int(
+        vision["stability"].get("minimum_inlier_frames", 0)
+    )
+    if minimum_inliers < 2 or capture_frames < minimum_inliers:
+        raise ConfigError(
+            "vision stability requires capture_frames >= minimum_inlier_frames >= 2"
+        )
 
     if data["arm"].get("work_frame") != "Base":
         raise ConfigError("arm.work_frame must be Base")
@@ -72,8 +132,6 @@ def load_config(path: str | Path = "config/app.yaml") -> dict[str, Any]:
         raise ConfigError(
             "arm.tool_frame must be Arm_Tip because TCP offset is applied in code"
         )
-    if int(data["vision"].get("required_detection_count", 0)) != 12:
-        raise ConfigError("vision.required_detection_count must be 12")
     maximum_tool_tilt_deg = float(
         data["motion"].get("maximum_tool_tilt_deg", 0.0)
     )
@@ -85,27 +143,11 @@ def load_config(path: str | Path = "config/app.yaml") -> dict[str, Any]:
     if set(data["racks"]) != {"rack_1", "rack_2"}:
         raise ConfigError("racks must contain exactly rack_1 and rack_2")
 
-    marker_colors = []
     for rack_id, rack in data["racks"].items():
         if not isinstance(rack, dict):
             raise ConfigError(f"racks.{rack_id} must be a mapping")
-        if rack.get("marker_color") not in ("red", "green"):
-            raise ConfigError(f"racks.{rack_id}.marker_color must be red or green")
-        marker_colors.append(rack["marker_color"])
-        fallback = rack.get("fallback_plane_z_mm")
-        if fallback is not None:
-            try:
-                fallback_value = float(fallback)
-            except (TypeError, ValueError) as error:
-                raise ConfigError(
-                    f"racks.{rack_id}.fallback_plane_z_mm must be a number or null"
-                ) from error
-            if not math.isfinite(fallback_value):
-                raise ConfigError(
-                    f"racks.{rack_id}.fallback_plane_z_mm must be finite"
-                )
-    if set(marker_colors) != {"red", "green"}:
-        raise ConfigError("rack_1 and rack_2 must use different red/green markers")
+        if not str(rack.get("calibration_path", "")).strip():
+            raise ConfigError(f"racks.{rack_id}.calibration_path cannot be empty")
 
     return data
 

@@ -23,10 +23,20 @@ from tube_grabber.fakes import FakeArm, FakeGripper, FakeRackObserver
 from tube_grabber.hardware import D435Camera, RealManArm, RealManGripper
 from tube_grabber.motion import MotionExecutor, MotionPlanner
 from tube_grabber.motion.planner import rotation_distance_deg, rpy_to_rotation
-from tube_grabber.vision.detector import YoloDetector
-from tube_grabber.vision.grid import GridMapper
-from tube_grabber.vision.marker import K0MarkerDetector
-from tube_grabber.vision.pipeline import RackVision
+from tube_grabber.vision.detector import YoloCapDetector
+from tube_grabber.vision.plane import RackPlaneFitConfig
+from tube_grabber.vision.pose_pipeline import (
+    CapturedRackFrame,
+    PoseRackVision,
+    RackMatchingConfig,
+    RackStabilityConfig,
+)
+from tube_grabber.vision.rack_calibration import load_rack_calibration
+from tube_grabber.vision.rack_pose import (
+    RackPoseQualityConfig,
+    RackPoseStability,
+    YoloRackPoseDetector,
+)
 from tube_grabber.workflow import ManipulationWorkflow
 
 
@@ -37,35 +47,63 @@ class CameraRackObserver:
         self,
         camera: CameraPort,
         arm: ArmPort,
-        vision: RackVision,
+        vision: PoseRackVision,
     ) -> None:
         self.camera = camera
         self.arm = arm
         self.vision = vision
         self.last_frame: CameraFrame | None = None
         self.last_observation: RackObservation | None = None
+        self.last_pose_stability: RackPoseStability | None = None
 
     def observe_rack(self, rack_id: str) -> RackObservation:
-        pose_before = self.arm.get_pose()
-        frame = self.camera.capture()
-        pose_after = self.arm.get_pose()
-        if _pose_distance_mm(pose_before, pose_after) > 0.5:
-            raise VisionError("right arm moved while the D435 frame was captured")
-        angle = rotation_distance_deg(
-            rpy_to_rotation(
-                (pose_before.rx_rad, pose_before.ry_rad, pose_before.rz_rad)
-            ),
-            rpy_to_rotation(
-                (pose_after.rx_rad, pose_after.ry_rad, pose_after.rz_rad)
-            ),
-        )
-        if angle > 0.2:
-            raise VisionError("right arm rotated while the D435 frame was captured")
-
-        observation = self.vision.observe(frame, rack_id, pose_after)
-        self.last_frame = frame
+        samples = self._capture_samples()
+        observation = self.vision.observe(samples, rack_id)
+        self.last_frame = min(
+            samples,
+            key=lambda item: abs(item.frame.timestamp_ms - observation.timestamp_ms),
+        ).frame
         self.last_observation = observation
         return observation
+
+    def capture_stable_pose(self) -> tuple[CameraFrame, RackPoseStability]:
+        """Capture the same filtered rack pose used by interactive calibration."""
+        samples = self._capture_samples()
+        stability, _ = self.vision.detect_stable_pose(samples)
+        frame = samples[stability.inlier_indices[-1]].frame
+        self.last_frame = frame
+        self.last_pose_stability = stability
+        return frame, stability
+
+    def _capture_samples(self) -> tuple[CapturedRackFrame, ...]:
+        samples: list[CapturedRackFrame] = []
+        reference_pose: Pose6D | None = None
+        for _ in range(self.vision.capture_frames):
+            pose_before = self.arm.get_pose()
+            frame = self.camera.capture()
+            pose_after = self.arm.get_pose()
+            self._require_stationary(pose_before, pose_after, "during D435 capture")
+            if reference_pose is None:
+                reference_pose = pose_after
+            else:
+                self._require_stationary(
+                    reference_pose,
+                    pose_after,
+                    "across the multi-frame inference window",
+                )
+            samples.append(CapturedRackFrame(frame, pose_after))
+        return tuple(samples)
+
+    @staticmethod
+    def _require_stationary(first: Pose6D, second: Pose6D, context: str) -> None:
+        if _pose_distance_mm(first, second) > 0.5:
+            raise VisionError(f"right arm moved {context}")
+        angle = rotation_distance_deg(
+            rpy_to_rotation((first.rx_rad, first.ry_rad, first.rz_rad)),
+            rpy_to_rotation((second.rx_rad, second.ry_rad, second.rz_rad)),
+        )
+        if angle > 0.2:
+            raise VisionError(f"right arm rotated {context}")
 
 
 @dataclass
@@ -161,20 +199,39 @@ class TubeGrabberRuntime:
         power_state = self.arm.get_power_state()
         if power_state != 1:
             raise HardwareError(
-                f"right arm power state is {power_state}; power it on from the controller first"
+                f"right arm power state is {power_state}; "
+                "power it on from the controller first"
             )
+        self.arm.require_healthy()
 
 
-def build_runtime(config: dict[str, Any]) -> TubeGrabberRuntime:
+def build_runtime(
+    config: dict[str, Any],
+    *,
+    load_calibrations: bool = True,
+) -> TubeGrabberRuntime:
     """Create fake or real implementations without connecting any hardware."""
     runtime_config = config["runtime"]
     arm_config = config["arm"]
     camera_config = config["camera"]
     gripper_config = config["gripper"]
     vision_config = config["vision"]
-    marker_config = config["markers"]
     geometry_config = config["geometry"]
     motion_config = config["motion"]
+    cap_config = vision_config["cap"]
+    pose_config = vision_config["rack_pose"]
+    stability_config = vision_config["stability"]
+    plane_data = vision_config["plane"]
+    matching_config = vision_config["matching"]
+    pose_quality = _rack_pose_quality_config(pose_config)
+    rack_stability = _rack_stability_config(stability_config)
+    rack_plane = _rack_plane_config(plane_data)
+    rack_matching = _rack_matching_config(
+        cap_config,
+        matching_config,
+        camera_config,
+        geometry_config,
+    )
 
     poses = load_yaml(motion_config["poses_path"])
     observation_data = _mapping(poses.get("observation_pose"), "observation_pose")
@@ -192,6 +249,12 @@ def build_runtime(config: dict[str, Any]) -> TubeGrabberRuntime:
             work_frame=str(arm_config.get("work_frame", "Base")),
             tool_frame=str(arm_config.get("tool_frame", "Arm_Tip")),
             expected_dof=int(arm_config.get("expected_dof", 7)),
+            reject_conflicting_processes=bool(
+                arm_config.get("reject_conflicting_processes", True)
+            ),
+            conflicting_processes=arm_config.get(
+                "conflicting_processes", ("atom", "zhixing_ctrl.py")
+            ),
         )
         camera = D435Camera(
             serial=str(camera_config["serial"]),
@@ -203,36 +266,32 @@ def build_runtime(config: dict[str, Any]) -> TubeGrabberRuntime:
         )
         gripper = RealManGripper(
             arm=arm,
-            baudrate=int(gripper_config["baudrate"]),
-            tool_voltage=int(gripper_config["tool_voltage"]),
             open_position=int(gripper_config["open_position"]),
             grip_position=int(gripper_config["grip_position"]),
             reset_position=int(gripper_config["reset_position"]),
             command_timeout_s=int(gripper_config["command_timeout_s"]),
-            power_on_wait_s=float(gripper_config["power_on_wait_s"]),
-            protocol_startup_wait_s=float(
-                gripper_config["protocol_startup_wait_s"]
-            ),
+            position_tolerance=int(gripper_config["position_tolerance"]),
+            poll_interval_s=float(gripper_config["poll_interval_s"]),
+            state_read_attempts=int(gripper_config["state_read_attempts"]),
+            state_read_retry_s=float(gripper_config["state_read_retry_s"]),
         )
-        detector = YoloDetector(
-            model_path=project_path(vision_config["model_path"]),
-            class_names=vision_config["class_names"],
-            confidence=float(vision_config["confidence"]),
-            iou=float(vision_config["iou"]),
-            image_size=int(vision_config["image_size"]),
+        cap_detector = YoloCapDetector(
+            model_path=project_path(cap_config["model_path"]),
+            class_names=cap_config["class_names"],
+            confidence=float(cap_config["confidence"]),
+            iou=float(cap_config["iou"]),
+            image_size=int(cap_config["image_size"]),
             device=str(vision_config["device"]),
         )
-        marker_detector = K0MarkerDetector(
-            minimum_area_px=int(marker_config["minimum_area_px"]),
-            minimum_saturation=int(marker_config["minimum_saturation"]),
-            minimum_value=int(marker_config["minimum_value"]),
-            maximum_aspect_ratio=float(
-                marker_config["maximum_aspect_ratio"]
-            ),
-            hue_ranges={
-                "red": marker_config["red_hue_ranges"],
-                "green": marker_config["green_hue_ranges"],
-            },
+        pose_detector = YoloRackPoseDetector(
+            model_path=project_path(pose_config["model_path"]),
+            class_names=pose_config["class_names"],
+            keypoint_names=pose_config["keypoint_names"],
+            confidence=float(pose_config["confidence"]),
+            keypoint_confidence=float(pose_config["keypoint_confidence"]),
+            iou=float(pose_config["iou"]),
+            image_size=int(pose_config["image_size"]),
+            device=str(vision_config["device"]),
         )
         hand_eye = load_yaml(geometry_config["hand_eye_path"])
         if hand_eye.get("translation_unit") != "mm":
@@ -243,41 +302,23 @@ def build_runtime(config: dict[str, Any]) -> TubeGrabberRuntime:
             )
         if hand_eye.get("target_frame") != "end_right":
             raise ConfigError("hand-eye target_frame must be end_right")
-        rack_colors = {
-            rack_id: str(rack["marker_color"])
-            for rack_id, rack in config["racks"].items()
-        }
-        fallback_planes = {
-            rack_id: rack.get("fallback_plane_z_mm")
-            for rack_id, rack in config["racks"].items()
-        }
-        vision = RackVision(
-            detector=detector,
-            marker_detector=marker_detector,
-            grid_mapper=GridMapper(
-                maximum_spacing_cv=float(vision_config["maximum_spacing_cv"]),
-                maximum_marker_corner_distance_factor=float(
-                    vision_config["maximum_marker_corner_distance_factor"]
-                ),
-            ),
+        calibrations = {}
+        for rack_id, rack in config["racks"].items():
+            calibration_path = project_path(rack["calibration_path"])
+            calibrations[rack_id] = (
+                load_rack_calibration(calibration_path, rack_id)
+                if load_calibrations and calibration_path.is_file()
+                else None
+            )
+        vision = PoseRackVision(
+            rack_pose_detector=pose_detector,
+            cap_detector=cap_detector,
+            calibrations=calibrations,
             hand_eye_end_from_camera=hand_eye["matrix"],
-            rack_marker_colors=rack_colors,
-            fallback_plane_z_mm=fallback_planes,
-            required_detection_count=int(
-                vision_config["required_detection_count"]
-            ),
-            depth_window_px=int(vision_config["depth_window_px"]),
-            depth_min_mm=float(camera_config["depth_min_mm"]),
-            depth_max_mm=float(camera_config["depth_max_mm"]),
-            cap_top_above_rack_mm=float(
-                geometry_config["cap_top_above_rack_mm"]
-            ),
-            maximum_cap_z_deviation_mm=float(
-                vision_config["maximum_cap_z_deviation_mm"]
-            ),
-            maximum_plane_calibration_error_mm=float(
-                vision_config["maximum_plane_calibration_error_mm"]
-            ),
+            pose_quality=pose_quality,
+            stability=rack_stability,
+            plane_config=rack_plane,
+            matching=rack_matching,
         )
         observer: object = CameraRackObserver(camera, arm, vision)
     elif mode == "fake":
@@ -415,6 +456,73 @@ def _fake_observation(
         plane_z_mm=plane_z_mm,
         slots=tuple(slots),
         timestamp_ms=0.0,
+    )
+
+
+def _rack_pose_quality_config(data: dict[str, Any]) -> RackPoseQualityConfig:
+    red = _mapping(data.get("k0_red_marker"), "vision.rack_pose.k0_red_marker")
+    return RackPoseQualityConfig(
+        minimum_rack_area_px2=float(data["minimum_rack_area_px2"]),
+        maximum_opposite_side_ratio=float(data["maximum_opposite_side_ratio"]),
+        screw_edge_margin=float(data["screw_edge_margin"]),
+        k0_red_patch_radius_px=int(red["patch_radius_px"]),
+        k0_red_minimum_ratio=float(red["minimum_red_ratio"]),
+        k0_red_minimum_ratio_margin=float(red["minimum_ratio_margin"]),
+        k0_red_minimum_saturation=int(red["minimum_saturation"]),
+        k0_red_minimum_value=int(red["minimum_value"]),
+    )
+
+
+def _rack_stability_config(data: dict[str, Any]) -> RackStabilityConfig:
+    return RackStabilityConfig(
+        capture_frames=int(data["capture_frames"]),
+        minimum_inlier_frames=int(data["minimum_inlier_frames"]),
+        maximum_frame_residual_px=float(data["maximum_frame_residual_px"]),
+        maximum_keypoint_spread_px=float(data["maximum_keypoint_spread_px"]),
+        minimum_occupancy_agreement=float(data["minimum_occupancy_agreement"]),
+        maximum_slot_position_spread_mm=float(
+            data["maximum_slot_position_spread_mm"]
+        ),
+        maximum_cap_position_spread_mm=float(
+            data["maximum_cap_position_spread_mm"]
+        ),
+    )
+
+
+def _rack_plane_config(data: dict[str, Any]) -> RackPlaneFitConfig:
+    return RackPlaneFitConfig(
+        sample_stride_px=int(data["sample_stride_px"]),
+        roi_margin_px=int(data["roi_margin_px"]),
+        landmark_exclusion_radius_px=int(
+            data["landmark_exclusion_radius_px"]
+        ),
+        ransac_iterations=int(data["ransac_iterations"]),
+        inlier_threshold_mm=float(data["inlier_threshold_mm"]),
+        minimum_inliers=int(data["minimum_inliers"]),
+        minimum_inlier_ratio=float(data["minimum_inlier_ratio"]),
+        maximum_rms_error_mm=float(data["maximum_rms_error_mm"]),
+        maximum_tilt_deg=float(data["maximum_tilt_deg"]),
+    )
+
+
+def _rack_matching_config(
+    cap: dict[str, Any],
+    matching: dict[str, Any],
+    camera: dict[str, Any],
+    geometry: dict[str, Any],
+) -> RackMatchingConfig:
+    return RackMatchingConfig(
+        depth_window_px=int(cap["depth_window_px"]),
+        depth_min_mm=float(camera["depth_min_mm"]),
+        depth_max_mm=float(camera["depth_max_mm"]),
+        cap_top_above_rack_mm=float(geometry["cap_top_above_rack_mm"]),
+        maximum_cap_height_error_mm=float(cap["maximum_height_error_mm"]),
+        cap_slot_max_distance_factor=float(
+            matching["cap_slot_max_distance_factor"]
+        ),
+        maximum_calibration_keypoint_shift_ratio=float(
+            matching["maximum_calibration_keypoint_shift_ratio"]
+        ),
     )
 
 

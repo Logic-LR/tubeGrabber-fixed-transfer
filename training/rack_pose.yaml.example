@@ -1,0 +1,13 @@
+# Copy to training/rack_pose.yaml and replace path with the labelled dataset.
+path: ../datasets/rack_pose
+train: images/train
+val: images/val
+test: images/test
+
+names:
+  0: rack_surface
+
+# Fixed runtime order: four clockwise corners, then their matching screw holes.
+kpt_shape: [8, 3]
+# K0 is a physical identity fixed by the red marker; it is never relabelled.
+flip_idx: [0, 1, 2, 3, 4, 5, 6, 7]

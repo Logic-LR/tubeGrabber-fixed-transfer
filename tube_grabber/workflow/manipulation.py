@@ -252,12 +252,19 @@ class ManipulationWorkflow:
         latest = self.scan(prepared.command.source.rack_id)
         original = prepared.observation
 
-        marker_shift_px = _pixel_distance(original.marker, latest.marker)
-        if marker_shift_px > self.scene_recheck_pixel_tolerance_px:
-            raise WorkflowError(
-                f"rack K0 moved {marker_shift_px:.2f} px after planning; "
-                "scan and plan again"
-            )
+        original_keypoints = original.rack_keypoints or (original.marker,)
+        latest_keypoints = latest.rack_keypoints or (latest.marker,)
+        if len(original_keypoints) != len(latest_keypoints):
+            raise WorkflowError("rack keypoint contract changed after planning")
+        for index, (first, second) in enumerate(
+            zip(original_keypoints, latest_keypoints)
+        ):
+            shift_px = _pixel_distance(first, second)
+            if shift_px > self.scene_recheck_pixel_tolerance_px:
+                raise WorkflowError(
+                    f"rack keypoint {index} moved {shift_px:.2f} px after planning; "
+                    "scan and plan again"
+                )
         plane_shift_mm = abs(latest.plane_z_mm - original.plane_z_mm)
         if plane_shift_mm > self.scene_recheck_plane_tolerance_mm:
             raise WorkflowError(
@@ -328,14 +335,14 @@ class ManipulationWorkflow:
             )
         if slot.hole_on_plane_base is None:
             raise WorkflowError(f"destination {address.text} has no hole coordinate")
-        plane_z_mm = _finite(observation.plane_z_mm, "rack plane_z_mm")
+        _finite(observation.plane_z_mm, "rack plane_z_mm")
+        hole = slot.hole_on_plane_base
         target_z_mm = (
-            plane_z_mm
+            hole.z_mm
             + self.cap_top_above_rack_mm
             - self.grasp_depth_below_cap_mm
             + self.seating_adjust_mm
         )
-        hole = slot.hole_on_plane_base
         return Point3D(
             hole.x_mm,
             hole.y_mm,
