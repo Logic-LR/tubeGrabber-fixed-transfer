@@ -25,9 +25,9 @@ class ApplicationIntegrationTests(unittest.TestCase):
                 parse_transfer("rack_1.r1c1", "rack_1.r1c2")
             )
             self.assertGreater(len(runtime.arm.moves), 0)  # type: ignore[attr-defined]
-            self.assertTrue(  # type: ignore[attr-defined]
-                all(move[2] for move in runtime.arm.moves)
-            )
+            # Pick/place segments are linear; the final return to the taught
+            # observation pose deliberately uses RealMan movej_p.
+            self.assertFalse(runtime.arm.moves[-1][2])  # type: ignore[attr-defined]
             self.assertEqual(
                 runtime.gripper.actions,  # type: ignore[attr-defined]
                 ["setup", "open_for_pick", "grip", "release"],
@@ -53,6 +53,52 @@ class ApplicationIntegrationTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(HardwareError, "observation pose"):
                 runtime.require_observation_pose()
+        finally:
+            runtime.close()
+
+    def test_runtime_moves_to_taught_observation_pose_automatically(self) -> None:
+        runtime = build_runtime(load_config())
+        try:
+            runtime.start(
+                need_arm=True,
+                need_camera=False,
+                need_gripper=False,
+            )
+            runtime.arm.pose = Pose6D(  # type: ignore[attr-defined]
+                100.0,
+                320.0,
+                -150.0,
+                -3.0,
+                0.0,
+                -1.6,
+            )
+
+            reached = runtime.move_to_observation_pose()
+
+            self.assertEqual(reached, runtime.observation_pose)
+            self.assertEqual(  # type: ignore[attr-defined]
+                runtime.arm.moves[-1],
+                (runtime.observation_pose, 10, False),
+            )
+        finally:
+            runtime.close()
+
+    def test_fake_closed_loop_supports_a_non_default_destination(self) -> None:
+        runtime = build_runtime(load_config())
+        try:
+            runtime.start(
+                need_arm=True,
+                need_camera=False,
+                need_gripper=True,
+            )
+
+            command = parse_transfer("rack_1.r1c1", "rack_1.r2c6")
+            final = runtime.workflow.transfer(command)
+
+            self.assertEqual(
+                final.slot(command.destination).occupancy.value,
+                "occupied",
+            )
         finally:
             runtime.close()
 

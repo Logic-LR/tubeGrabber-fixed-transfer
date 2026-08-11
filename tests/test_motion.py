@@ -23,6 +23,7 @@ class MotionPlannerTests(unittest.TestCase):
             transit_speed_percent=10,
             approach_speed_percent=5,
             maximum_orientation_error_deg=5,
+            maximum_single_orientation_change_deg=30,
             maximum_tool_tilt_deg=180,
             tube_total_length_mm=20,
             required_carried_clearance_mm=10,
@@ -77,6 +78,14 @@ class MotionPlannerTests(unittest.TestCase):
         with self.assertRaisesRegex(MotionError, "orientation"):
             self.planner.plan_approach(current, Point3D(100, 80, 0))
 
+    def test_taught_pose_move_rejects_a_large_orientation_change(self) -> None:
+        with self.assertRaisesRegex(MotionError, "orientation change"):
+            self.planner.plan_pose_move(
+                Pose6D(0, 0, 0, 0, 0, 0),
+                Pose6D(0, 0, 0, 0, 0, 1.0),
+                name="observation_pose",
+            )
+
     def test_upward_tool_configuration_is_rejected(self) -> None:
         with self.assertRaisesRegex(MotionError, r"tool \+Z"):
             MotionPlanner(
@@ -87,6 +96,7 @@ class MotionPlannerTests(unittest.TestCase):
                 transit_speed_percent=10,
                 approach_speed_percent=5,
                 maximum_orientation_error_deg=5,
+                maximum_single_orientation_change_deg=30,
                 maximum_tool_tilt_deg=1,
                 tube_total_length_mm=20,
                 required_carried_clearance_mm=10,
@@ -102,6 +112,7 @@ class MotionPlannerTests(unittest.TestCase):
                 transit_speed_percent=10,
                 approach_speed_percent=5,
                 maximum_orientation_error_deg=5,
+                maximum_single_orientation_change_deg=30,
                 maximum_tool_tilt_deg=180,
                 tube_total_length_mm=20,
                 required_carried_clearance_mm=10,

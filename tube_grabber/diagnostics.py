@@ -73,7 +73,7 @@ def format_prepared_transfer(prepared: PreparedTransfer) -> str:
     source = prepared.source_target
     destination = prepared.destination_target
     lines = [
-        "planned TCP targets (base_right, mm):",
+        "preview TCP targets (base_right, mm):",
         f"  pick  = [{source.x_mm:.2f}, {source.y_mm:.2f}, {source.z_mm:.2f}]",
         (
             "  place = "
@@ -89,7 +89,7 @@ def format_prepared_transfer(prepared: PreparedTransfer) -> str:
             f"{prepared.start_pose.ry_rad:.4f}, "
             f"{prepared.start_pose.rz_rad:.4f}]"
         ),
-        "planned flange waypoints (base_right, mm + rad):",
+        "preview flange waypoints (execution refreshes coordinates):",
     ]
     sections = (
         ("pick", prepared.pick_approach),

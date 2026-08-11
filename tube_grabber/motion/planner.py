@@ -22,6 +22,7 @@ class MotionPlanner:
         transit_speed_percent: int,
         approach_speed_percent: int,
         maximum_orientation_error_deg: float,
+        maximum_single_orientation_change_deg: float,
         maximum_tool_tilt_deg: float,
         tube_total_length_mm: float,
         required_carried_clearance_mm: float,
@@ -50,6 +51,12 @@ class MotionPlanner:
         self.maximum_orientation_error_deg = _range(
             maximum_orientation_error_deg,
             "maximum_orientation_error_deg",
+            0.0,
+            180.0,
+        )
+        self.maximum_single_orientation_change_deg = _range(
+            maximum_single_orientation_change_deg,
+            "maximum_single_orientation_change_deg",
             0.0,
             180.0,
         )
@@ -87,6 +94,25 @@ class MotionPlanner:
         target_tcp: Point3D,
     ) -> MotionPlan:
         """Lift safely, move above the target, then descend vertically."""
+        corridor = self.plan_above_target(current_flange, target_tcp)
+        return MotionPlan(
+            corridor.waypoints
+            + (
+                Waypoint(
+                    "descend",
+                    self._flange_pose(target_tcp),
+                    self.approach_speed_percent,
+                    linear=True,
+                ),
+            )
+        )
+
+    def plan_above_target(
+        self,
+        current_flange: Pose6D,
+        target_tcp: Point3D,
+    ) -> MotionPlan:
+        """Reach the safe corridor above a target without descending."""
         _require_same_frame(current_flange.frame, target_tcp.frame)
         orientation_error_deg = self._require_vertical_orientation(
             current_flange
@@ -138,23 +164,56 @@ class MotionPlanner:
                     linear=True,
                 )
             )
-        waypoints.extend(
-            (
-                Waypoint(
-                    "above_target",
-                    self._flange_pose(above_tcp),
-                    self.transit_speed_percent,
-                    linear=True,
-                ),
-                Waypoint(
-                    "descend",
-                    self._flange_pose(target_tcp),
-                    self.approach_speed_percent,
-                    linear=True,
-                ),
+        waypoints.append(
+            Waypoint(
+                "above_target",
+                self._flange_pose(above_tcp),
+                self.transit_speed_percent,
+                linear=True,
             )
         )
         return MotionPlan(tuple(waypoints))
+
+    def plan_pose_move(
+        self,
+        current_flange: Pose6D,
+        target_flange: Pose6D,
+        *,
+        name: str,
+    ) -> MotionPlan:
+        """Plan one guarded joint-space move to a taught flange pose."""
+        _require_same_frame(current_flange.frame, target_flange.frame)
+        change_deg = rotation_distance_deg(
+            rpy_to_rotation(
+                (
+                    current_flange.rx_rad,
+                    current_flange.ry_rad,
+                    current_flange.rz_rad,
+                )
+            ),
+            rpy_to_rotation(
+                (
+                    target_flange.rx_rad,
+                    target_flange.ry_rad,
+                    target_flange.rz_rad,
+                )
+            ),
+        )
+        if change_deg > self.maximum_single_orientation_change_deg:
+            raise MotionError(
+                f"{name} orientation change {change_deg:.2f} deg exceeds "
+                f"{self.maximum_single_orientation_change_deg:.2f} deg"
+            )
+        return MotionPlan(
+            (
+                Waypoint(
+                    name,
+                    target_flange,
+                    self.transit_speed_percent,
+                    linear=False,
+                ),
+            )
+        )
 
     def plan_retreat(self, current_flange: Pose6D) -> MotionPlan:
         """Move the TCP straight upward after gripping or releasing."""

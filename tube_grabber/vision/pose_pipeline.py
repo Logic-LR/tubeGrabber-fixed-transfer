@@ -221,9 +221,18 @@ class PoseRackVision:
         self,
         samples: Sequence[CapturedRackFrame],
         expected_rack_id: str,
+        *,
+        ignored_elevated_slot: SlotAddress | None = None,
     ) -> RackObservation:
         if expected_rack_id not in self._calibrations:
             raise VisionError(f"unknown rack id: {expected_rack_id}")
+        if (
+            ignored_elevated_slot is not None
+            and ignored_elevated_slot.rack_id != expected_rack_id
+        ):
+            raise VisionError(
+                "ignored elevated cap slot must belong to the observed rack"
+            )
         calibration = self._calibrations[expected_rack_id]
         if calibration is None:
             raise VisionError(
@@ -245,7 +254,11 @@ class PoseRackVision:
         for item in inlier_frames:
             try:
                 observations.append(
-                    self._observe_frame(item, calibration)
+                    self._observe_frame(
+                        item,
+                        calibration,
+                        ignored_elevated_slot=ignored_elevated_slot,
+                    )
                 )
             except VisionError as exc:
                 failures.append(f"frame {item.source_index}: {exc}")
@@ -262,6 +275,8 @@ class PoseRackVision:
         self,
         item: _PoseFrame,
         calibration: RackSlotCalibration,
+        *,
+        ignored_elevated_slot: SlotAddress | None,
     ) -> _FrameObservation:
         sample = item.sample
         caps = self._cap_detector.detect(sample.frame.color)
@@ -320,6 +335,27 @@ class PoseRackVision:
                 cap_height - self._matching.cap_top_above_rack_mm
             )
             if height_error > self._matching.maximum_cap_height_error_mm:
+                if (
+                    address == ignored_elevated_slot
+                    and cap_height
+                    > self._matching.cap_top_above_rack_mm
+                    + self._matching.maximum_cap_height_error_mm
+                ):
+                    # During destination recheck, the one carried tube is
+                    # deliberately parked above the requested empty slot.  Its
+                    # elevated cap may project onto that slot, but it is not a
+                    # seated occupant.  Every other high/low mismatch remains
+                    # a hard failure.
+                    slots.append(
+                        SlotObservation(
+                            address=address,
+                            occupancy=Occupancy.EMPTY,
+                            confidence=item.pose.confidence,
+                            pixel=slot_pixel,
+                            hole_on_plane_base=hole,
+                        )
+                    )
+                    continue
                 raise VisionError(
                     f"{address.text} cap height {cap_height:.2f}mm differs from "
                     f"{self._matching.cap_top_above_rack_mm:.2f}mm "

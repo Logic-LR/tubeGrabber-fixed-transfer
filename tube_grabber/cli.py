@@ -846,13 +846,41 @@ def _transfer(
             "真实运动被锁定"
         )
     try:
+        # Match the proven AprilTag workflow: verify the empty tool, then let
+        # the program move to the taught global observation pose itself.
+        runtime.start(
+            need_arm=True,
+            need_camera=False,
+            need_gripper=True,
+        )
+        runtime.require_motion_ready()
+        if runtime.mode == "real" and bool(
+            config["runtime"]["require_enter_before_motion"]
+        ):
+            print(
+                "程序将自动移动右臂到全局观察位。\n"
+                "确认左臂已收回、底盘锁定、夹爪/TCP 确实空载、"
+                "路径无障碍且急停可触达。"
+            )
+            try:
+                empty_confirmation = input(
+                    "输入 EMPTY 并回车，允许移动到观察位："
+                ).strip()
+            except EOFError as error:
+                raise WorkflowError(
+                    "observation-pose authorization input is unavailable"
+                ) from error
+            if empty_confirmation != "EMPTY":
+                raise WorkflowError(
+                    "operator did not confirm an empty tool for observation motion"
+                )
+        runtime.move_to_observation_pose()
         runtime.start(
             need_arm=True,
             need_camera=runtime.mode == "real",
             need_gripper=False,
         )
         runtime.require_observation_pose()
-        runtime.require_motion_ready()
         prepared = runtime.workflow.prepare_transfer(command)
         print(format_observation(prepared.observation))
         print(format_prepared_transfer(prepared))
@@ -864,8 +892,7 @@ def _transfer(
             print(
                 "即将执行："
                 f"{command.source.text} -> {command.destination.text}\n"
-                "确认左臂已收回、底盘锁定、夹爪为空、"
-                "急停可触达。"
+                "确认首轮观测和预览航点正确，急停可触达。"
             )
             try:
                 authorization = input("输入 MOVE 并回车开始：").strip()
@@ -876,23 +903,20 @@ def _transfer(
             if authorization != "MOVE":
                 raise WorkflowError("operator did not authorize motion")
 
-        runtime.start(
-            need_arm=True,
-            need_camera=runtime.mode == "real",
-            need_gripper=True,
-        )
         runtime.require_motion_ready()
         runtime.require_observation_pose()
-        runtime.workflow.verify_prepared_scene(prepared)
+        prepared = runtime.workflow.refresh_prepared_transfer(prepared)
         _save_scan_if_available(runtime, config)
         print(
-            "执行前复扫通过：K0、12 槽状态、目标坐标和架面"
-            "均未变化。"
+            "执行前复扫通过，并已用本次最新坐标重建抓取计划。"
         )
-        runtime.workflow.execute_transfer(prepared)
+        final = runtime.workflow.execute_transfer(prepared)
+        print("最终闭环复扫：")
+        print(format_observation(final))
+        _save_scan_if_available(runtime, config)
         print(
             f"运动完成：{command.source.text} -> {command.destination.text}；"
-            "尚未自动复扫，请回到观测位后运行 scan 验证结果。"
+            "已自动回到观察位，并确认源槽为空、目标槽占用。"
         )
         return 0
     except BaseException:

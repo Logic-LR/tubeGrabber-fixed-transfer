@@ -9,7 +9,10 @@ Agent 只负责把一条文本命令转换为 `TransferCommand`。`agent-plan` �
      → 现有 plan-transfer → 视觉扫描与运动规划 → 打印
 ```
 
-跨架命令可以被 Gemini 理解，但在导航实现前仍由现有同架安全锁拒绝。即使使用 `agent-transfer`，Gemini 也只生成结构化命令；Python 项目仍负责所有校验和运动执行。真机模式下还必须输入 `MOVE` 才会开始运动。
+跨架命令可以被 Gemini 理解，但在导航实现前仍由现有同架安全锁拒绝。即使使用
+`agent-transfer`，Gemini 也只生成结构化命令；Python 项目仍负责所有校验和运动执行。
+真机模式下先确认空载并输入 `EMPTY`，程序自动进入观察位；预览后还必须输入 `MOVE`
+才会开始抓放。携管目标复检、最新坐标重规划和最终闭环复扫不能被 Agent 绕过。
 
 ## 离线模式
 
@@ -54,7 +57,9 @@ python -m tube_grabber agent-plan --agent-provider gemini --text "把一号架�
 python -m tube_grabber agent-transfer --agent-provider gemini --text "把一号架第一行第一列的试管移动到一号架第一行第二列"
 ```
 
-在 `runtime.mode: fake` 下，该命令只驱动假硬件。切换到 `real` 后，它才会连接真实设备，并继续受到运动参数确认、观测位、同架限制、场景复扫和 `MOVE` 人工确认保护。
+在 `runtime.mode: fake` 下，该命令只驱动假硬件。切换到 `real` 后，它才会连接真实设备，
+并继续受到运动参数确认、自动观察位、同架限制、`EMPTY`/`MOVE` 授权、执行前复扫、携管
+目标复检和最终闭环验证保护。
 
 Gemini 不会获得任何机械臂函数。它只能提出 `propose_transfer` 的六个参数；自动函数调用被关闭，Python 再检查：
 

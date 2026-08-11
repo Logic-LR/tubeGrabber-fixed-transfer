@@ -145,6 +145,8 @@ motion:
   # 150 mm keeps the carried tube above neighbouring tube caps during XY travel.
   retreat_height_mm: 150.0
   maximum_orientation_error_deg: 5.0
+  # Reused from the proven AprilTag global-observation move gate.
+  maximum_single_orientation_change_deg: 30.0
   maximum_tool_tilt_deg: 1.0
   maximum_single_move_mm: 500.0
   position_reached_tolerance_mm: 1.0

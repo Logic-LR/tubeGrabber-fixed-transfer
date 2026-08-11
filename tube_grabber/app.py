@@ -57,8 +57,20 @@ class CameraRackObserver:
         self.last_pose_stability: RackPoseStability | None = None
 
     def observe_rack(self, rack_id: str) -> RackObservation:
+        return self.observe_rack_for_task(rack_id)
+
+    def observe_rack_for_task(
+        self,
+        rack_id: str,
+        *,
+        ignored_elevated_slot: SlotAddress | None = None,
+    ) -> RackObservation:
         samples = self._capture_samples()
-        observation = self.vision.observe(samples, rack_id)
+        observation = self.vision.observe(
+            samples,
+            rack_id,
+            ignored_elevated_slot=ignored_elevated_slot,
+        )
         self.last_frame = min(
             samples,
             key=lambda item: abs(item.frame.timestamp_ms - observation.timestamp_ms),
@@ -181,6 +193,17 @@ class TubeGrabberRuntime:
                 f"limit is {self.observation_orientation_tolerance_deg:.2f} deg"
             )
         return current
+
+    def move_to_observation_pose(self) -> Pose6D:
+        """Move to and verify the taught global observation pose."""
+        if self.mode == "real" and not self.observation_pose_confirmed:
+            raise ConfigError(
+                "config/poses.yaml observation_pose.confirmed is false; "
+                "verify the taught pose at low speed before automatic motion"
+            )
+        self.require_motion_ready()
+        self.workflow.move_to_observation_pose()
+        return self.require_observation_pose()
 
     def require_motion_ready(self) -> None:
         """Read real-controller state; never power on or change run mode here."""
@@ -325,12 +348,10 @@ def build_runtime(
         arm = FakeArm(observation_pose)
         camera = None
         gripper = FakeGripper()
+        cap_height = float(geometry_config["cap_top_above_rack_mm"])
         observer = FakeRackObserver(
             *(
-                _fake_observation(
-                    rack_id,
-                    float(geometry_config["cap_top_above_rack_mm"]),
-                )
+                _fake_observation(rack_id, cap_height)
                 for rack_id in config["racks"]
             )
         )
@@ -346,6 +367,9 @@ def build_runtime(
         approach_speed_percent=int(arm_config["approach_speed_percent"]),
         maximum_orientation_error_deg=float(
             motion_config["maximum_orientation_error_deg"]
+        ),
+        maximum_single_orientation_change_deg=float(
+            motion_config["maximum_single_orientation_change_deg"]
         ),
         maximum_tool_tilt_deg=float(
             motion_config["maximum_tool_tilt_deg"]
@@ -375,6 +399,7 @@ def build_runtime(
         observer=observer,
         planner=planner,
         executor=executor,
+        observation_pose=observation_pose,
         grasp_depth_below_cap_mm=float(
             geometry_config["grasp_depth_below_cap_mm"]
         ),
@@ -416,8 +441,12 @@ def build_runtime(
 def _fake_observation(
     rack_id: str,
     cap_top_above_rack_mm: float,
+    *,
+    occupied: set[tuple[int, int]] | None = None,
 ) -> RackObservation:
     """Deterministic 2x6 rack used by fake mode and the full-chain test."""
+    if occupied is None:
+        occupied = {(1, 1)}
     plane_z_mm = -470.0
     slots: list[SlotObservation] = []
     for row in (1, 2):
@@ -425,12 +454,13 @@ def _fake_observation(
             address = SlotAddress(rack_id, row, column)
             x_mm = 20.0 + 22.0 * (column - 1)
             y_mm = 290.0 + 32.0 * (row - 1)
-            occupied = row == 1 and column == 1
+            is_occupied = (row, column) in occupied
+            hole = Point3D(x_mm, y_mm, plane_z_mm)
             slots.append(
                 SlotObservation(
                     address=address,
                     occupancy=(
-                        Occupancy.OCCUPIED if occupied else Occupancy.EMPTY
+                        Occupancy.OCCUPIED if is_occupied else Occupancy.EMPTY
                     ),
                     confidence=0.99,
                     pixel=Pixel(x_mm, y_mm),
@@ -440,14 +470,10 @@ def _fake_observation(
                             y_mm,
                             plane_z_mm + cap_top_above_rack_mm,
                         )
-                        if occupied
+                        if is_occupied
                         else None
                     ),
-                    hole_on_plane_base=(
-                        None
-                        if occupied
-                        else Point3D(x_mm, y_mm, plane_z_mm)
-                    ),
+                    hole_on_plane_base=hole,
                 )
             )
     return RackObservation(

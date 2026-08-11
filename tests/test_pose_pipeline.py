@@ -5,6 +5,7 @@ import unittest
 import cv2
 import numpy as np
 
+from tube_grabber.core.errors import VisionError
 from tube_grabber.core.models import (
     Box,
     CameraFrame,
@@ -13,6 +14,7 @@ from tube_grabber.core.models import (
     Occupancy,
     Pixel,
     Pose6D,
+    SlotAddress,
 )
 from tube_grabber.vision.plane import RackPlaneFitConfig
 from tube_grabber.vision.pose_pipeline import (
@@ -116,6 +118,32 @@ class PosePipelineTests(unittest.TestCase):
                 for slot in observation.slots[1:]
             )
         )
+
+        elevated_samples = []
+        for index, sample in enumerate(samples):
+            elevated_depth = np.asarray(sample.frame.depth_mm).copy()
+            elevated_depth[144:157, 144:157] = 900.0
+            elevated_samples.append(
+                CapturedRackFrame(
+                    CameraFrame(
+                        color=np.asarray(sample.frame.color).copy(),
+                        depth_mm=elevated_depth,
+                        intrinsics=sample.frame.intrinsics,
+                        timestamp_ms=float(index + 10),
+                        frame_number=index + 10,
+                    ),
+                    sample.arm_pose,
+                )
+            )
+        with self.assertRaises(VisionError):
+            vision.observe(elevated_samples, "rack_1")
+
+        carried = vision.observe(
+            elevated_samples,
+            "rack_1",
+            ignored_elevated_slot=SlotAddress("rack_1", 1, 1),
+        )
+        self.assertIs(carried.slots[0].occupancy, Occupancy.EMPTY)
 
 
 if __name__ == "__main__":

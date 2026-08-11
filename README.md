@@ -34,7 +34,9 @@ D435 连续 RGB-D 帧 + 右臂观察位姿
                            │
                     RackObservation
                            │
-             Workflow → Motion → Hardware
+     自动观察位 → 最新抓取 → 高位目标复检/重规划
+                           │
+              放置 → 自动回观察位 → 最终复扫
 ```
 
 边界保持单向：`vision` 只输出观测，`workflow` 只处理任务状态，`motion` 只处理
@@ -43,7 +45,8 @@ D435 连续 RGB-D 帧 + 右臂观察位姿
 
 详细设计见 [架构说明](docs/ARCHITECTURE.md)，模型与标注见
 [模型契约](docs/MODEL_CONTRACT.md)。从安装、训练、标定到真机分阶段执行的完整操作流程见
-[详细使用说明](docs/USAGE.md)。
+[详细使用说明](docs/USAGE.md)。底盘站点、跨架状态机、失败恢复、麦克风选择和离线语音方案见
+[底盘导航与语音控制完整实施方案](docs/NAVIGATION_AND_VOICE.md)。
 
 ## 安装与 GPU
 
@@ -130,8 +133,11 @@ python -m tube_grabber transfer --source rack_1.r1c1 --destination rack_1.r2c6
 ```
 
 默认 `runtime.mode: fake`。真实运动还要求观察位与运动参数已确认、控制器为真实模式且
-上电、控制器和关节无错误、没有 `atom/zhixing_ctrl.py` 抢占控制、执行前复扫通过，
-并由操作者输入 `MOVE`。
+上电、控制器和关节无错误、没有 `atom/zhixing_ctrl.py` 抢占控制。`transfer` 先要求
+确认物理空载并输入 `EMPTY`，然后自动进入旧 AprilTag 流程的全局观察位；预览后输入
+`MOVE`。执行前复扫会重建抓取计划，携管时在目标高位走廊复检并重规划放置，释放后
+自动回观察位，最终确认源空、目标占用才成功。`plan-transfer` 保持零运动承诺，因此
+运行前仍需人工将右臂置于观察位。
 
 夹爪按当前 RealMan 两指夹爪接入：只使用两指夹爪专用的
 `rm_set_gripper_position` 与 `rm_get_gripper_state`；不会调用六自由度灵巧手的
@@ -145,6 +151,7 @@ python -m unittest discover -s tests -v
 ```
 
 离线测试覆盖模型契约、K0 红点、关键点几何、多帧滤波、双点标定、架面 RANSAC、
-完整 Pose+cap+槽位流水线、坐标变换、运动规划、硬件 SDK 翻译和 fake 抓放闭环。
+完整 Pose+cap+槽位流水线、坐标变换、最新坐标重规划、观察位往返、最终状态验证、
+运动规划、硬件 SDK 翻译和 fake 抓放闭环。
 
 首次真机必须按 [实验室检查清单](docs/LAB_CHECKLIST.md) 从只读检查逐级推进。

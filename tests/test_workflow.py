@@ -22,14 +22,18 @@ def rack_observation(
     rack_id: str = "rack_1",
     *,
     occupied: set[tuple[int, int]] | None = None,
+    source_x_mm: float | None = None,
     destination_x_mm: float | None = None,
 ) -> RackObservation:
-    occupied = occupied or {(1, 1)}
+    if occupied is None:
+        occupied = {(1, 1)}
     slots = []
     for row in (1, 2):
         for column in range(1, 7):
             address = SlotAddress(rack_id, row, column)
             x_mm = float((column - 1) * 20)
+            if (row, column) == (1, 1) and source_x_mm is not None:
+                x_mm = source_x_mm
             if (row, column) == (1, 2) and destination_x_mm is not None:
                 x_mm = destination_x_mm
             y_mm = float((row - 1) * 20)
@@ -45,9 +49,7 @@ def rack_observation(
                     cap_top_base=(
                         Point3D(x_mm, y_mm, 47.0) if is_occupied else None
                     ),
-                    hole_on_plane_base=(
-                        None if is_occupied else Point3D(x_mm, y_mm, 0.0)
-                    ),
+                    hole_on_plane_base=Point3D(x_mm, y_mm, 0.0),
                 )
             )
     return RackObservation(
@@ -83,6 +85,7 @@ class ManipulationWorkflowTests(unittest.TestCase):
             transit_speed_percent=10,
             approach_speed_percent=5,
             maximum_orientation_error_deg=5,
+            maximum_single_orientation_change_deg=180,
             maximum_tool_tilt_deg=180,
             tube_total_length_mm=20,
             required_carried_clearance_mm=10,
@@ -101,6 +104,7 @@ class ManipulationWorkflowTests(unittest.TestCase):
             observer=observer,
             planner=planner,
             executor=executor,
+            observation_pose=Pose6D(0, 0, 90, 0, 0, 0),
             grasp_depth_below_cap_mm=5,
             cap_top_above_rack_mm=47,
             seating_adjust_mm=2,
@@ -118,11 +122,28 @@ class ManipulationWorkflowTests(unittest.TestCase):
             SlotAddress("rack_1", 1, 1),
             SlotAddress("rack_1", 1, 2),
         )
+        observer.set_sequence(
+            "rack_1",
+            [
+                rack_observation(),
+                rack_observation(),
+                rack_observation(occupied=set()),
+                rack_observation(occupied={(1, 2)}),
+            ],
+        )
 
-        workflow.transfer(command)
+        final = workflow.transfer(command)
 
         self.assertFalse(workflow.holding_tube)
-        self.assertEqual(observer.calls, ["rack_1"])
+        self.assertIs(
+            final.slot(SlotAddress("rack_1", 1, 1)).occupancy,
+            Occupancy.EMPTY,
+        )
+        self.assertIs(
+            final.slot(SlotAddress("rack_1", 1, 2)).occupancy,
+            Occupancy.OCCUPIED,
+        )
+        self.assertEqual(observer.calls, ["rack_1"] * 4)
         self.assertEqual(
             gripper.actions,
             ["setup", "open_for_pick", "grip", "release"],
@@ -133,7 +154,8 @@ class ManipulationWorkflowTests(unittest.TestCase):
         ]
         self.assertTrue(any(abs(value - 42.0) < 1e-6 for value in tcp_z_values))
         self.assertTrue(any(abs(value - 44.0) < 1e-6 for value in tcp_z_values))
-        self.assertTrue(all(linear for _, _, linear in arm.moves))
+        self.assertFalse(arm.moves[-1][2])
+        self.assertEqual(arm.moves[-1][0], Pose6D(0, 0, 90, 0, 0, 0))
 
     def test_cross_rack_transfer_is_explicitly_rejected(self) -> None:
         workflow, arm, gripper, observer = self.build_workflow(
@@ -264,6 +286,92 @@ class ManipulationWorkflowTests(unittest.TestCase):
 
         self.assertEqual(arm.moves, [])
         self.assertEqual(gripper.actions, ["setup"])
+
+    def test_refresh_rebuilds_pick_plan_from_latest_coordinates(self) -> None:
+        workflow, _, _, observer = self.build_workflow(rack_observation())
+        command = TransferCommand(
+            SlotAddress("rack_1", 1, 1),
+            SlotAddress("rack_1", 1, 2),
+        )
+        preview = workflow.prepare_transfer(command)
+        observer.observations["rack_1"] = rack_observation(source_x_mm=2.0)
+
+        refreshed = workflow.refresh_prepared_transfer(preview)
+
+        self.assertEqual(preview.source_target.x_mm, 0.0)
+        self.assertEqual(refreshed.source_target.x_mm, 2.0)
+        self.assertEqual(
+            flange_to_tcp_point(
+                refreshed.pick_approach.waypoints[-1].pose,
+                (0, 0, 10),
+            ).x_mm,
+            2.0,
+        )
+
+    def test_destination_recheck_replans_place_from_latest_coordinate(self) -> None:
+        workflow, arm, _, observer = self.build_workflow(rack_observation())
+        observer.set_sequence(
+            "rack_1",
+            [
+                rack_observation(),
+                rack_observation(),
+                rack_observation(occupied=set(), destination_x_mm=22.0),
+                rack_observation(
+                    occupied={(1, 2)},
+                    destination_x_mm=22.0,
+                ),
+            ],
+        )
+
+        workflow.transfer(
+            TransferCommand(
+                SlotAddress("rack_1", 1, 1),
+                SlotAddress("rack_1", 1, 2),
+            )
+        )
+
+        tcp_points = [
+            flange_to_tcp_point(move[0], (0, 0, 10)) for move in arm.moves
+        ]
+        self.assertTrue(
+            any(
+                abs(point.x_mm - 22.0) < 1e-6
+                and abs(point.z_mm - 44.0) < 1e-6
+                for point in tcp_points
+            )
+        )
+
+    def test_final_scan_must_prove_source_empty_and_destination_occupied(self) -> None:
+        workflow, arm, _, observer = self.build_workflow(rack_observation())
+        observer.set_sequence(
+            "rack_1",
+            [
+                rack_observation(),
+                rack_observation(),
+                rack_observation(occupied=set()),
+                rack_observation(occupied=set()),
+            ],
+        )
+
+        with self.assertRaisesRegex(WorkflowError, "final verification failed"):
+            workflow.transfer(
+                TransferCommand(
+                    SlotAddress("rack_1", 1, 1),
+                    SlotAddress("rack_1", 1, 2),
+                )
+            )
+
+        self.assertFalse(workflow.holding_tube)
+        self.assertEqual(arm.pose, Pose6D(0, 0, 90, 0, 0, 0))
+
+    def test_carrying_tube_cannot_enter_low_observation_pose(self) -> None:
+        workflow, arm, _, _ = self.build_workflow(rack_observation())
+        workflow._holding_tube = True
+
+        with self.assertRaisesRegex(WorkflowError, "low observation pose"):
+            workflow.move_to_observation_pose()
+
+        self.assertEqual(arm.moves, [])
 
 
 if __name__ == "__main__":
