@@ -146,8 +146,14 @@ def load_config(path: str | Path = "config/app.yaml") -> dict[str, Any]:
             "and at most 30"
         )
 
-    if set(data["racks"]) != {"rack_1", "rack_2"}:
-        raise ConfigError("racks must contain exactly rack_1 and rack_2")
+    rack_ids = set(data["racks"])
+    if not rack_ids:
+        raise ConfigError("racks must contain at least one configured rack")
+    unsupported_racks = sorted(rack_ids - {"rack_1", "rack_2"})
+    if unsupported_racks:
+        raise ConfigError(
+            "unsupported rack ids: " + ", ".join(unsupported_racks)
+        )
 
     for rack_id, rack in data["racks"].items():
         if not isinstance(rack, dict):

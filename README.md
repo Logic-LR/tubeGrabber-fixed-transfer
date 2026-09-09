@@ -17,8 +17,7 @@
 | RealMan 七轴机械臂与 RM Plus 两指夹爪 | 已接入 |
 | 同一试管架内抓放与最终复扫 | 已实现 |
 | 本地 / Gemini 文本命令解析 | 已实现 |
-| rack_1 现场标定 | 已包含 |
-| rack_2 现场标定 | 尚未包含，real 模式预检会拒绝通过 |
+| 单个 rack_1 现场标定 | 已包含；默认配置不要求第二个试管架 |
 | 跨试管架底盘导航 | 未实现，命令会被安全拒绝 |
 | 语音输入与播报 | 未实现 |
 
@@ -217,12 +216,14 @@ python -m tube_grabber camera-check
 python -m tube_grabber gripper-status
 ~~~
 
-- <code>doctor</code> 检查配置、模型契约、CUDA、SDK、手眼、两份 rack 标定和运动确认锁；
+- <code>doctor</code> 检查配置、模型契约、CUDA、SDK、手眼、已配置 rack 的标定和运动确认锁；
 - <code>arm-status</code> 只读取右臂法兰位姿、真实/仿真模式、电源和健康状态；
 - <code>camera-check</code> 采集彩色图和 16 位毫米深度图到 <code>artifacts/</code>；
 - <code>gripper-status</code> 只读取 RM Plus 状态，不发送夹爪位置命令。
 
-当前仓库缺少 <code>config/racks/rack_2.yaml</code>，因此 real 模式 <code>doctor</code> 会保持失败，直到 rack_2 也完成标定。这是安全门禁，不应通过修改代码绕过。
+默认配置只有 <code>rack_1</code>，因此 real 模式只要求
+<code>config/racks/rack_1.yaml</code>。普通篮筐不是试管架，不应加入
+<code>racks</code> 或伪造槽位标定。
 
 ### 3. 标定试管架
 
@@ -236,7 +237,6 @@ python -m tube_grabber gripper-status
 
 ~~~bash
 python -m tube_grabber calibrate-rack --rack rack_1
-python -m tube_grabber calibrate-rack --rack rack_2
 ~~~
 
 已有标定必须显式覆盖：
@@ -319,6 +319,8 @@ python -m tube_grabber transfer \
 | <code>transfer</code> | 执行同架抓放闭环 | 是 |
 | <code>agent-plan</code> | 解析文本并走只读规划流程 | 否 |
 | <code>agent-transfer</code> | 解析文本并走完整抓放流程 | 是 |
+| <code>plan-fixed-transfer</code> | 校验固定取管到篮子的完整路径，不加载视觉 | 否 |
+| <code>fixed-transfer</code> | 执行已确认的固定取管到篮子循环 | 是 |
 
 查看全部参数：
 
@@ -328,6 +330,20 @@ python -m tube_grabber <command> --help
 ~~~
 
 安装为可编辑包后，也可以将 <code>python -m tube_grabber</code> 替换为 <code>tube-grabber</code>。
+
+## 固定取管到篮子
+
+如果取管点和篮子位置始终固定，可以使用不依赖相机、YOLO 和机架标定的独立流程：
+
+~~~bash
+python -m tube_grabber plan-fixed-transfer
+python -m tube_grabber fixed-transfer
+~~~
+
+点位模板位于 <code>config/fixed_transfer.yaml</code>，默认包含空值且
+<code>confirmed: false</code>，因此不能直接驱动真机。必须先在当前机械臂与当前
+<code>Arm_Tip</code> 工具坐标系下示教五个位姿，完成低速验收后再解除确认锁。完整步骤见
+[固定取管到篮子](docs/FIXED_TRANSFER.md)。
 
 ## Agent 命令
 
@@ -426,9 +442,9 @@ python -m unittest discover -s tests -v
 
 确认两个权重都是 Detection 模型，且 <code>model.names == {0: 'item'}</code>。旧的 YOLO Pose / <code>rack_pose.pt</code> 不属于当前运行链。
 
-### rack_2 标定缺失
+### 命令误用了 rack_2
 
-在真实模式下完成 <code>calibrate-rack --rack rack_2</code>。不要复制 rack_1 的标定文件，因为槽位布局、相机视角和安装误差不同。
+默认配置只有 <code>rack_1</code>。使用 <code>rack_2</code> 的扫描、标定或搬运命令会被明确拒绝；不要复制 <code>rack_1</code> 的标定文件冒充第二个架子。普通篮筐请使用独立的固定取放流程。
 
 ### 扫描不稳定
 

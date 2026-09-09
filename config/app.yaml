@@ -3,7 +3,7 @@
 runtime:
   # fake: no hardware; real: D435 + RealMan arm + gripper
   # Keep fake until every item in docs/LAB_CHECKLIST.md has passed.
-  mode: real
+  mode: fake
   require_enter_before_motion: true
   save_debug_images: true
   observation_position_tolerance_mm: 5.0
@@ -138,8 +138,6 @@ vision:
 racks:
   rack_1:
     calibration_path: "config/racks/rack_1.yaml"
-  rack_2:
-    calibration_path: "config/racks/rack_2.yaml"
 
 geometry:
   hand_eye_path: "config/hand_eye.yaml"
@@ -162,7 +160,7 @@ geometry:
 motion:
   # Set true only after checking TCP offset, workspace and all rack-normal
   # motion heights on the physical right arm at low speed.
-  parameters_confirmed: true
+  parameters_confirmed: false
   # 真机测试时，每次扫描、夹爪动作和机械臂航点前必须空回车确认。
   confirm_each_step: true
   poses_path: "config/poses.yaml"

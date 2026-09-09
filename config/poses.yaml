@@ -4,4 +4,4 @@
 observation_pose:
   position_mm: [145.278, 290.904, 57.145]
   rpy_rad: [-2.452, 0.087, -1.605]
-  confirmed: true
+  confirmed: false

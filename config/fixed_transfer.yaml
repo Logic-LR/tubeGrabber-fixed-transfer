@@ -1,0 +1,36 @@
+# Fixed pickup -> basket placement program.
+# Poses are the controller's current Arm_Tip pose in base_right. Positions are
+# millimetres and rotations are radians, matching `arm-status` output.
+#
+# Deliberately incomplete: use `arm-status` while the arm is hand-taught at
+# each pose, replace every null, validate with `plan-fixed-transfer`, then set
+# confirmed to true only after a low-speed, supervised dry cycle.
+
+schema_version: fixed_tube_transfer.v1
+confirmed: false
+frame: base_right
+
+start_gate:
+  position_tolerance_mm: 5.0
+  orientation_tolerance_deg: 2.0
+
+motion:
+  transit_speed_percent: 10
+  approach_speed_percent: 5
+
+poses:
+  home:
+    position_mm: [147.002, 287.528, 57.174]
+    rpy_rad: [-2.445000, 0.077000, -1.608000]
+  pick_above:
+    position_mm: [null, null, null]
+    rpy_rad: [null, null, null]
+  pick:
+    position_mm: [null, null, null]
+    rpy_rad: [null, null, null]
+  basket_above:
+    position_mm: [null, null, null]
+    rpy_rad: [null, null, null]
+  basket_release:
+    position_mm: [null, null, null]
+    rpy_rad: [null, null, null]

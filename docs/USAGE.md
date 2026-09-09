@@ -26,7 +26,8 @@
 - 缺少 CUDA 时回退到 CPU；
 - 缺少模型或标定时回退到旧槽位 Detection；
 
-跨架命令会被明确拒绝。导航接入前只能执行同一 `rack_id` 内的搬运。
+默认配置只启用 `rack_1`；未配置的 `rack_2` 命令会被明确拒绝。导航接入前只能执行同一
+`rack_id` 内的搬运。普通篮筐不属于 rack，不需要槽位标定。
 
 ## 2. 安全要求
 
@@ -281,7 +282,6 @@ python -m tube_grabber transfer \
 
 ```text
 rack_1.r1c1 ... rack_1.r2c6
-rack_2.r1c1 ... rack_2.r2c6
 ```
 
 源槽必须是 `OCCUPIED`，目标槽必须是 `EMPTY`，源和目标不能相同。
@@ -310,7 +310,7 @@ python -m tube_grabber gripper-status
 
 ## 9. 正上方双圆心标定
 
-每个试管架分别标定一次。标定前：
+只标定配置中实际存在的试管架。默认单架配置只需要标定 `rack_1`。标定前：
 
 1. 清空 `r1c1` 和 `r2c6`；
 2. 低速手动将腕部相机移动到架面正上方；
@@ -321,7 +321,6 @@ python -m tube_grabber gripper-status
 
 ```bash
 python -m tube_grabber calibrate-rack --rack rack_1
-python -m tube_grabber calibrate-rack --rack rack_2
 ```
 
 界面操作：
@@ -340,7 +339,6 @@ python -m tube_grabber calibrate-rack --rack rack_2
 
 ```text
 config/racks/rack_1.yaml
-config/racks/rack_2.yaml
 ```
 
 已有标定只有显式添加 `--force` 才会覆盖：
@@ -388,11 +386,10 @@ python -m tube_grabber calibrate-corners --rack rack_1
 标定完成后，低速把右臂移回正常观察位。确认真实法兰位姿与 `config/poses.yaml` 一致后，
 才把 `observation_pose.confirmed` 设置为 `true`。
 
-分别扫描：
+扫描已配置的单个试管架：
 
 ```bash
 python -m tube_grabber scan --rack rack_1
-python -m tube_grabber scan --rack rack_2
 ```
 
 输出包含：
@@ -570,9 +567,9 @@ Gemini 只提出一个结构化搬运命令，不直接获得机械臂、夹爪�
 - 在安全位置重新验证张开和夹紧位置；
 - 状态不确定时按“可能仍夹着试管”处理。
 
-### 跨架任务被拒绝
+### 未配置的架子或跨架任务被拒绝
 
-这是当前版本的预期安全行为。底盘导航尚未接入，以下命令不会执行：
+这是当前版本的预期安全行为。默认只配置 `rack_1`，且底盘导航尚未接入，以下命令不会执行：
 
 ```text
 rack_1.* -> rack_2.*
@@ -587,7 +584,7 @@ rack_2.* -> rack_1.*
 2. Fake 扫描、规划和完整任务；
 3. CUDA 与两个模型契约；
 4. 只读机械臂、相机和夹爪检查；
-5. 两个架面的正上方双圆心标定；
+5. `rack_1` 架面的正上方双圆心标定；
 6. 正常观察位连续扫描统计；
 7. 无运动的全部航点检查；
 8. 安全空间中的夹爪开合；

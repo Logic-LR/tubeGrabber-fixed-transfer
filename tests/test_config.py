@@ -21,6 +21,20 @@ class ConfigTest(unittest.TestCase):
         )
         self.assertEqual(config["geometry"]["grasp_depth_below_cap_mm"], 28.0)
         self.assertEqual(config["agent"]["provider"], "local")
+        self.assertEqual(set(config["racks"]), {"rack_1"})
+
+    def test_single_rack_config_is_supported(self) -> None:
+        config = load_config()
+        self.assertEqual(list(config["racks"]), ["rack_1"])
+
+    def test_empty_rack_config_is_rejected(self) -> None:
+        config = load_yaml("config/app.yaml")
+        config["racks"] = {}
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "app.yaml"
+            path.write_text(yaml.safe_dump(config), encoding="utf-8")
+            with self.assertRaisesRegex(ConfigError, "at least one"):
+                load_config(path)
 
     def test_cpu_inference_is_rejected(self) -> None:
         config = load_yaml("config/app.yaml")

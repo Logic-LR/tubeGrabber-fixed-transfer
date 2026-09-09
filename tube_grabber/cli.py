@@ -31,6 +31,11 @@ from tube_grabber.diagnostics import (
     save_camera_frame,
     save_observation_image,
 )
+from tube_grabber.fixed_transfer import (
+    build_fixed_transfer_runtime,
+    format_fixed_transfer_program,
+    load_fixed_transfer_program,
+)
 from tube_grabber.vision.geometry import validate_transform
 from tube_grabber.vision.rack_calibration import (
     RackCircleFitConfig,
@@ -52,6 +57,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "doctor":
             return _doctor(config)
 
+        if args.command in ("plan-fixed-transfer", "fixed-transfer"):
+            return _fixed_transfer(
+                config,
+                fixed_config=args.fixed_config,
+                execute=args.command == "fixed-transfer",
+            )
+
         runtime = build_runtime(
             config,
             load_calibrations=args.command != "calibrate-rack",
@@ -63,6 +75,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "gripper-status":
             return _gripper_status(runtime)
         if args.command == "scan":
+            _require_configured_rack(config, args.rack)
             return _scan(
                 runtime,
                 config,
@@ -70,8 +83,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 display=not args.no_display,
             )
         if args.command == "calibrate-rack":
+            _require_configured_rack(config, args.rack)
             return _calibrate_rack(runtime, config, args.rack, force=args.force)
         if args.command == "calibrate-corners":
+            _require_configured_rack(config, args.rack)
             return _calibrate_corners(runtime, config, args.rack)
         if args.command in ("agent-plan", "agent-transfer"):
             return _agent_command(
@@ -83,6 +98,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         if args.command in ("plan-transfer", "transfer"):
             command = parse_transfer(args.source, args.destination)
+            _require_configured_transfer(config, command)
             if args.command == "plan-transfer":
                 return _plan_transfer(runtime, config, command)
             return _transfer(runtime, config, command)
@@ -123,6 +139,20 @@ def _parser() -> argparse.ArgumentParser:
         "gripper-status",
         help="只连接并读取两指夹爪状态，不发送夹爪运动",
     )
+    fixed_plan = subparsers.add_parser(
+        "plan-fixed-transfer",
+        help="校验并打印固定取管到篮子的全部动作，不连接任何硬件",
+    )
+    fixed_execute = subparsers.add_parser(
+        "fixed-transfer",
+        help="执行已确认的固定取管到篮子动作，不启动相机或视觉模型",
+    )
+    for fixed in (fixed_plan, fixed_execute):
+        fixed.add_argument(
+            "--fixed-config",
+            default="config/fixed_transfer.yaml",
+            help="固定取放点位文件（默认 config/fixed_transfer.yaml）",
+        )
 
     scan = subparsers.add_parser("scan", help="识别一个固定站的 2x6 试管架")
     scan.add_argument("--rack", required=True, choices=("rack_1", "rack_2"))
@@ -196,6 +226,52 @@ def _parser() -> argparse.ArgumentParser:
 def _add_transfer_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--source", required=True, help="例如 rack_1.r1c1")
     parser.add_argument("--destination", required=True, help="例如 rack_1.r2c6")
+
+
+def _fixed_transfer(
+    config: dict[str, Any],
+    *,
+    fixed_config: str,
+    execute: bool,
+) -> int:
+    program = load_fixed_transfer_program(project_path(fixed_config))
+    runtime = build_fixed_transfer_runtime(config, program)
+    print(format_fixed_transfer_program(program))
+    # Planning is intentionally hardware-free.  It validates the complete
+    # route against the configured workspace and step length while assuming
+    # the explicitly gated home pose as its start.
+    runtime.workflow.preview(program.home)
+    print("路径校验：通过（未连接机械臂、未初始化夹爪）")
+    if not execute:
+        return 0
+
+    if not program.confirmed:
+        raise ConfigError(
+            "fixed transfer program is not confirmed; teach and verify all poses first"
+        )
+    if runtime.mode == "real" and not runtime.motion_parameters_confirmed:
+        raise ConfigError(
+            "motion.parameters_confirmed is false; verify the current robot setup first"
+        )
+
+    if runtime.mode == "real" and bool(
+        config["runtime"].get("require_enter_before_motion", True)
+    ):
+        answer = input(
+            "确认机械臂位于 home、夹爪空载、路径无人无障碍且急停可触达；"
+            "输入 RUN 执行："
+        ).strip()
+        if answer != "RUN":
+            raise WorkflowError("operator did not authorize fixed transfer")
+
+    runtime.start(need_gripper=True)
+    try:
+        runtime.require_motion_ready()
+        runtime.workflow.execute()
+        print("固定取放：完成，机械臂已返回 home")
+        return 0
+    finally:
+        runtime.close()
 
 
 def _doctor(config: dict[str, Any]) -> int:
@@ -1388,6 +1464,7 @@ def _agent_command(
         print("命令信息不完整，未生成运动计划。")
         runtime.close()
         return 2
+    _require_configured_transfer(config, decision.command)
     print(
         "确定性校验后的命令："
         f"{decision.command.source.text} -> {decision.command.destination.text}"
@@ -1544,6 +1621,22 @@ def _require_local_transfer(command: TransferCommand) -> None:
             "当前版本尚未接入导航，跨架搬运被锁定；"
             "只能执行同一 rack 内搬运"
         )
+
+
+def _require_configured_rack(config: dict[str, Any], rack_id: str) -> None:
+    if rack_id not in config["racks"]:
+        available = ", ".join(sorted(config["racks"]))
+        raise ConfigError(
+            f"rack {rack_id!r} is not configured; available racks: {available}"
+        )
+
+
+def _require_configured_transfer(
+    config: dict[str, Any],
+    command: TransferCommand,
+) -> None:
+    _require_configured_rack(config, command.source.rack_id)
+    _require_configured_rack(config, command.destination.rack_id)
 
 
 def _save_scan_if_available(
