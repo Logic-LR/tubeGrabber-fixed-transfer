@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
 
 from tube_grabber.core.errors import MotionError
-from tube_grabber.core.models import MotionPlan, Pose6D
+from tube_grabber.core.models import MotionPlan, Pose6D, Waypoint
 from tube_grabber.core.ports import ArmPort
 from tube_grabber.motion.planner import rotation_distance_deg, rpy_to_rotation
 
@@ -23,8 +24,11 @@ class MotionExecutor:
         workspace_min_mm: Sequence[float],
         workspace_max_mm: Sequence[float],
         maximum_single_move_mm: float,
+        reached_check_settle_s: float = 0.0,
         position_reached_tolerance_mm: float,
         orientation_reached_tolerance_deg: float,
+        before_waypoint: Callable[[Waypoint], None] | None = None,
+        motion_state_changed: Callable[[bool], None] | None = None,
         frame: str = "base_right",
     ) -> None:
         self.arm = arm
@@ -44,6 +48,12 @@ class MotionExecutor:
             or self.maximum_single_move_mm <= 0
         ):
             raise MotionError("maximum_single_move_mm must be positive")
+        self.reached_check_settle_s = float(reached_check_settle_s)
+        if (
+            not math.isfinite(self.reached_check_settle_s)
+            or self.reached_check_settle_s < 0.0
+        ):
+            raise MotionError("reached_check_settle_s must be finite and non-negative")
         self.position_reached_tolerance_mm = _positive_finite(
             position_reached_tolerance_mm,
             "position_reached_tolerance_mm",
@@ -52,6 +62,8 @@ class MotionExecutor:
             orientation_reached_tolerance_deg,
             "orientation_reached_tolerance_deg",
         )
+        self.before_waypoint = before_waypoint
+        self.motion_state_changed = motion_state_changed
         if not frame:
             raise MotionError("executor frame cannot be empty")
         self.frame = frame
@@ -84,12 +96,24 @@ class MotionExecutor:
             for waypoint in plan.waypoints:
                 if _same_pose(current, waypoint.pose):
                     continue
-                self.arm.move_pose(
-                    waypoint.pose,
-                    waypoint.speed_percent,
-                    linear=waypoint.linear,
-                )
-                reached = self.arm.get_pose()
+                if self.before_waypoint is not None:
+                    self.before_waypoint(waypoint)
+                motion_notified = False
+                try:
+                    if self.motion_state_changed is not None:
+                        self.motion_state_changed(True)
+                        motion_notified = True
+                    self.arm.move_pose(
+                        waypoint.pose,
+                        waypoint.speed_percent,
+                        linear=waypoint.linear,
+                    )
+                    if self.reached_check_settle_s > 0.0:
+                        time.sleep(self.reached_check_settle_s)
+                    reached = self.arm.get_pose()
+                finally:
+                    if motion_notified and self.motion_state_changed is not None:
+                        self.motion_state_changed(False)
                 position_error_mm = _distance(reached, waypoint.pose)
                 orientation_error_deg = _orientation_distance_deg(
                     reached,
@@ -114,6 +138,19 @@ class MotionExecutor:
             if isinstance(error, MotionError):
                 raise
             raise MotionError(f"arm motion failed: {error}") from error
+
+    def set_before_waypoint(
+        self,
+        callback: Callable[[Waypoint], None] | None,
+    ) -> None:
+        self.before_waypoint = callback
+
+    def set_motion_state_changed(
+        self,
+        callback: Callable[[bool], None] | None,
+    ) -> None:
+        """Notify a display/recorder immediately around actual arm motion."""
+        self.motion_state_changed = callback
 
     def _require_frame(self, pose: Pose6D) -> None:
         if pose.frame != self.frame:

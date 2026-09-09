@@ -108,8 +108,14 @@ class FakeRackObserver:
             raise VisionError(
                 "fake destination must be empty and have a hole coordinate"
             )
-        cap_height = (
-            source.cap_top_base.z_mm - source.hole_on_plane_base.z_mm
+        delta = (
+            source.cap_top_base.x_mm - source.hole_on_plane_base.x_mm,
+            source.cap_top_base.y_mm - source.hole_on_plane_base.y_mm,
+            source.cap_top_base.z_mm - source.hole_on_plane_base.z_mm,
+        )
+        cap_height = sum(
+            delta[index] * before.approach_axis_base[index]
+            for index in range(3)
         )
         final_slots: list[SlotObservation] = []
         for slot in rechecked.slots:
@@ -118,8 +124,10 @@ class FakeRackObserver:
                     replace(
                         slot,
                         occupancy=Occupancy.OCCUPIED,
-                        cap_top_base=slot.hole_on_plane_base.shifted(
-                            dz_mm=cap_height
+                        cap_top_base=_shift_along(
+                            slot.hole_on_plane_base,
+                            before.approach_axis_base,
+                            cap_height,
                         ),
                     )
                 )
@@ -131,3 +139,12 @@ class FakeRackObserver:
             timestamp_ms=rechecked.timestamp_ms + 1.0,
         )
         return rechecked
+
+
+def _shift_along(point, axis, distance):
+    return type(point)(
+        point.x_mm + float(axis[0]) * float(distance),
+        point.y_mm + float(axis[1]) * float(distance),
+        point.z_mm + float(axis[2]) * float(distance),
+        point.frame,
+    )

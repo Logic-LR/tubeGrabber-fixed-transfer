@@ -1,8 +1,8 @@
-"""Manual two-anchor calibration for a regular rack slot grid."""
+"""Manual slot-grid and presentation-corner calibration for a rack."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from math import isfinite
 from pathlib import Path
@@ -22,7 +22,14 @@ from tube_grabber.vision.rack_pose import (
 )
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
+LANDMARK_SOURCE = "screw_centers_v1"
+DEFAULT_DISPLAY_CORNERS_UNIT = (
+    Pixel(0.0, 0.0),
+    Pixel(1.0, 0.0),
+    Pixel(1.0, 1.0),
+    Pixel(0.0, 1.0),
+)
 
 
 @dataclass(frozen=True)
@@ -82,7 +89,10 @@ class RackSlotCalibration:
     columns: int
     first_slot_unit: Pixel
     last_slot_unit: Pixel
-    reference_keypoints_unit: tuple[Pixel, ...]
+    display_corners_unit: tuple[Pixel, Pixel, Pixel, Pixel] = (
+        DEFAULT_DISPLAY_CORNERS_UNIT
+    )
+    display_corners_calibrated: bool = False
     keypoint_names: tuple[str, ...] = RACK_KEYPOINT_NAMES
     calibrated_at_utc: str = ""
 
@@ -93,8 +103,6 @@ class RackSlotCalibration:
             raise ValueError("the final runtime requires a 2x6 rack")
         if self.keypoint_names != RACK_KEYPOINT_NAMES:
             raise ValueError("rack calibration keypoint contract is incompatible")
-        if len(self.reference_keypoints_unit) != len(RACK_KEYPOINT_NAMES):
-            raise ValueError("rack calibration must contain eight reference keypoints")
         first = self.first_slot_unit
         last = self.last_slot_unit
         if not (
@@ -108,6 +116,20 @@ class RackSlotCalibration:
             raise ValueError(
                 "r2c6 must be in the rack +column and +row direction from r1c1"
             )
+        if len(self.display_corners_unit) != 4:
+            raise ValueError("display corner calibration must contain four points")
+        display = np.asarray(
+            [[point.u, point.v] for point in self.display_corners_unit],
+            dtype=np.float32,
+        )
+        if not np.all(np.isfinite(display)):
+            raise ValueError("display corner coordinates must be finite")
+        if not cv2.isContourConvex(display):
+            raise ValueError(
+                "display corners must form an ordered convex quadrilateral"
+            )
+        if abs(float(cv2.contourArea(display, oriented=True))) < 1e-4:
+            raise ValueError("display corner quadrilateral is too small")
 
     def slot_unit_points(self) -> tuple[tuple[SlotAddress, Pixel], ...]:
         result = []
@@ -135,55 +157,32 @@ class RackSlotCalibration:
         pixels = transform_pixels([item[1] for item in indexed], image_from_unit)
         return tuple((item[0], pixel) for item, pixel in zip(indexed, pixels))
 
-    def validate_reference_pose(
+    def project_display_corners(
         self,
         detection: RackPoseDetection,
-        maximum_shift_ratio: float,
-    ) -> float:
-        """Compare the eight-point layout in viewpoint-invariant rack units."""
-        if not isfinite(float(maximum_shift_ratio)) or maximum_shift_ratio <= 0.0:
-            raise ValueError("maximum_shift_ratio must be finite and positive")
-        _, unit_from_image = corner_homography(detection)
-        current_unit = transform_pixels(
-            tuple(item.pixel for item in detection.keypoints),
-            unit_from_image,
-        )
-        shifts = [
-            float(
-                np.hypot(
-                    current.u - reference.u,
-                    current.v - reference.v,
-                )
-            )
-            for current, reference in zip(
-                current_unit,
-                self.reference_keypoints_unit,
-            )
-        ]
-        maximum = max(shifts)
-        if maximum > float(maximum_shift_ratio):
-            index = int(np.argmax(shifts))
-            raise VisionError(
-                f"{RACK_KEYPOINT_NAMES[index]} normalized layout changed by "
-                f"{maximum:.4f}; limit is {maximum_shift_ratio:.4f}"
-            )
-        return maximum
+    ) -> tuple[Pixel, Pixel, Pixel, Pixel]:
+        """Project the four manually taught presentation corners."""
+        image_from_unit, _ = corner_homography(detection)
+        points = transform_pixels(self.display_corners_unit, image_from_unit)
+        return tuple(points)  # type: ignore[return-value]
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "schema_version": SCHEMA_VERSION,
+            "landmark_source": LANDMARK_SOURCE,
             "rack_id": self.rack_id,
             "grid": {"rows": self.rows, "columns": self.columns},
             "keypoint_names": list(self.keypoint_names),
-            "reference_keypoints_unit": [
-                [point.u, point.v] for point in self.reference_keypoints_unit
-            ],
             "anchors": {
                 "first_slot": "r1c1",
                 "last_slot": "r2c6",
                 "first_slot_unit": [self.first_slot_unit.u, self.first_slot_unit.v],
                 "last_slot_unit": [self.last_slot_unit.u, self.last_slot_unit.v],
             },
+            "display_corners_unit": [
+                [point.u, point.v] for point in self.display_corners_unit
+            ],
+            "display_corners_calibrated": self.display_corners_calibrated,
             "calibrated_at_utc": self.calibrated_at_utc,
         }
 
@@ -201,10 +200,6 @@ def calibrate_slot_grid(
     _, unit_from_image = corner_homography(detection)
     first, last = transform_pixels(
         (first_slot_pixel, last_slot_pixel),
-        unit_from_image,
-    )
-    reference_unit = transform_pixels(
-        tuple(item.pixel for item in detection.keypoints),
         unit_from_image,
     )
     margin = 0.02
@@ -226,11 +221,41 @@ def calibrate_slot_grid(
                 float(np.clip(last.u, 0.0, 1.0)),
                 float(np.clip(last.v, 0.0, 1.0)),
             ),
-            reference_keypoints_unit=reference_unit,
             calibrated_at_utc=datetime.now(timezone.utc).isoformat(),
         )
     except ValueError as exc:
         raise VisionError(f"invalid two-circle rack calibration: {exc}") from exc
+
+
+def calibrate_display_corners(
+    calibration: RackSlotCalibration,
+    detection: RackPoseDetection,
+    corner_pixels: Sequence[Pixel],
+) -> RackSlotCalibration:
+    """Keep slot anchors and teach four display points relative to screws."""
+    if len(corner_pixels) != 4:
+        raise VisionError("exactly four display corners are required")
+    polygon = np.asarray(
+        [[point.u, point.v] for point in corner_pixels],
+        dtype=np.float32,
+    )
+    if not cv2.isContourConvex(polygon):
+        raise VisionError(
+            "K0-K3 display corners must form an ordered convex quadrilateral"
+        )
+    if abs(float(cv2.contourArea(polygon, oriented=True))) < 100.0:
+        raise VisionError("display corner quadrilateral is too small")
+    _, unit_from_image = corner_homography(detection)
+    unit = transform_pixels(corner_pixels, unit_from_image)
+    try:
+        return replace(
+            calibration,
+            display_corners_unit=tuple(unit),  # type: ignore[arg-type]
+            display_corners_calibrated=True,
+            calibrated_at_utc=datetime.now(timezone.utc).isoformat(),
+        )
+    except ValueError as exc:
+        raise VisionError(f"invalid four-corner calibration: {exc}") from exc
 
 
 def load_rack_calibration(
@@ -251,19 +276,32 @@ def load_rack_calibration(
     try:
         if int(data.get("schema_version", 0)) != SCHEMA_VERSION:
             raise ValueError(f"schema_version must be {SCHEMA_VERSION}")
+        if str(data.get("landmark_source", "")) != LANDMARK_SOURCE:
+            raise ValueError(f"landmark_source must be {LANDMARK_SOURCE}")
         grid = _mapping(data.get("grid"), "grid")
         anchors = _mapping(data.get("anchors"), "anchors")
         first = _pixel(anchors.get("first_slot_unit"), "first_slot_unit")
         last = _pixel(anchors.get("last_slot_unit"), "last_slot_unit")
+        display_data = data.get("display_corners_unit")
+        display_corners = (
+            DEFAULT_DISPLAY_CORNERS_UNIT
+            if display_data is None
+            else tuple(
+                _pixel(value, f"display_corners_unit[{index}]")
+                for index, value in enumerate(
+                    _sequence(display_data, "display_corners_unit")
+                )
+            )
+        )
         calibration = RackSlotCalibration(
             rack_id=str(data.get("rack_id", "")),
             rows=int(grid.get("rows", 0)),
             columns=int(grid.get("columns", 0)),
             first_slot_unit=first,
             last_slot_unit=last,
-            reference_keypoints_unit=tuple(
-                _pixel(value, "reference_keypoints_unit")
-                for value in data.get("reference_keypoints_unit", ())
+            display_corners_unit=display_corners,  # type: ignore[arg-type]
+            display_corners_calibrated=bool(
+                data.get("display_corners_calibrated", False)
             ),
             keypoint_names=tuple(
                 str(value) for value in data.get("keypoint_names", ())
@@ -378,3 +416,9 @@ def _pixel(value: object, name: str) -> Pixel:
     ):
         raise ValueError(f"{name} must contain two numbers")
     return Pixel(float(value[0]), float(value[1]))
+
+
+def _sequence(value: object, name: str) -> Sequence[object]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise ValueError(f"{name} must be a sequence")
+    return value

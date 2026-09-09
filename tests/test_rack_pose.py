@@ -2,34 +2,31 @@ from __future__ import annotations
 
 import unittest
 
+from tube_grabber.core.errors import VisionError
 import cv2
 import numpy as np
 
-from tube_grabber.core.errors import VisionError
-from tube_grabber.core.models import Box, Pixel
+from tube_grabber.core.models import Box, Detection, Pixel
 from tube_grabber.vision.rack_pose import (
     RACK_KEYPOINT_NAMES,
     RackKeypoint,
     RackPoseDetection,
+    ScrewMarkerConfig,
     fuse_rack_pose_detections,
-    validate_k0_red_marker,
+    rack_detection_from_screws,
     validate_rack_pose_geometry,
 )
 
 
-def pose(shift_x: float = 0.0, *, swap_screws: bool = False) -> RackPoseDetection:
+def pose(shift_x: float = 0.0, *, crossed: bool = False) -> RackPoseDetection:
     points = [
         (100, 100),
         (500, 100),
         (500, 300),
         (100, 300),
-        (140, 140),
-        (460, 140),
-        (460, 260),
-        (140, 260),
     ]
-    if swap_screws:
-        points[4], points[6] = points[6], points[4]
+    if crossed:
+        points[1], points[2] = points[2], points[1]
     return RackPoseDetection(
         confidence=0.95,
         box=Box(90 + shift_x, 90, 510 + shift_x, 310),
@@ -41,19 +38,60 @@ def pose(shift_x: float = 0.0, *, swap_screws: bool = False) -> RackPoseDetectio
 
 
 class RackPoseTests(unittest.TestCase):
-    def test_geometry_checks_screw_identity(self) -> None:
+    def test_screw_centers_are_oriented_from_white_k0_marker(self) -> None:
+        image = np.full((420, 640, 3), (40, 150, 40), dtype=np.uint8)
+        points = ((100, 100), (540, 100), (540, 320), (100, 320))
+        detections = []
+        for x, y in points:
+            cv2.circle(image, (x, y), 6, (0, 0, 0), -1)
+            detections.append(
+                Detection("screw", 0.9, Box(x - 8, y - 8, x + 8, y + 8))
+            )
+        # The real marker is on the green rack surface.  A larger white label
+        # outside the diagonally opposite corner must not steal K0.  Input
+        # detections are deliberately shuffled.
+        cv2.circle(image, (124, 124), 6, (245, 245, 245), -1)
+        cv2.circle(image, (566, 346), 8, (245, 245, 245), -1)
+        detection = rack_detection_from_screws(
+            image,
+            [detections[2], detections[0], detections[3], detections[1]],
+            marker=ScrewMarkerConfig(
+                minimum_value=180,
+                maximum_saturation=70,
+                search_radius_factor=0.45,
+                screw_exclusion_scale=1.3,
+                minimum_area_px2=18,
+                maximum_area_ratio=3.0,
+                minimum_score_ratio=1.25,
+                minimum_rack_aspect_ratio=1.5,
+            ),
+        )
+        self.assertEqual(detection.pixel("k0"), Pixel(100, 100))
+        self.assertEqual(detection.pixel("k1"), Pixel(540, 100))
+        self.assertEqual(detection.pixel("k2"), Pixel(540, 320))
+        self.assertEqual(detection.pixel("k3"), Pixel(100, 320))
+
+    def test_screw_rack_requires_exactly_four_detections(self) -> None:
+        with self.assertRaisesRegex(VisionError, "exactly four"):
+            rack_detection_from_screws(
+                np.zeros((100, 100, 3), dtype=np.uint8),
+                [],
+                marker=ScrewMarkerConfig(
+                    180, 70, 0.45, 1.3, 18, 3.0, 1.25, 1.5
+                ),
+            )
+
+    def test_geometry_rejects_crossed_corner_order(self) -> None:
         validate_rack_pose_geometry(
             pose(),
             minimum_area_px2=10_000,
             maximum_opposite_side_ratio=1.2,
-            screw_edge_margin=0.02,
         )
-        with self.assertRaisesRegex(VisionError, "wrong rack quadrant"):
+        with self.assertRaisesRegex(VisionError, "crossed or non-convex"):
             validate_rack_pose_geometry(
-                pose(swap_screws=True),
+                pose(crossed=True),
                 minimum_area_px2=10_000,
                 maximum_opposite_side_ratio=1.2,
-                screw_edge_margin=0.02,
             )
 
     def test_multi_frame_fusion_rejects_one_whole_frame_outlier(self) -> None:
@@ -65,38 +103,9 @@ class RackPoseTests(unittest.TestCase):
             maximum_keypoint_spread_px=2.0,
             minimum_area_px2=10_000,
             maximum_opposite_side_ratio=1.2,
-            screw_edge_margin=0.02,
         )
         self.assertEqual(stable.inlier_indices, (0, 1, 2))
         self.assertAlmostEqual(stable.detection.pixel("k0").u, 100.0)
-
-    def test_red_dot_must_be_at_screw_k0(self) -> None:
-        image = np.zeros((400, 600, 3), dtype=np.uint8)
-        cv2.circle(image, (140, 140), 6, (0, 0, 255), -1)
-        scores = validate_k0_red_marker(
-            image,
-            pose(),
-            patch_radius_px=12,
-            minimum_red_ratio=0.05,
-            minimum_ratio_margin=0.03,
-            minimum_saturation=100,
-            minimum_value=80,
-        )
-        self.assertGreater(scores[0], scores[1])
-
-        wrong = np.zeros_like(image)
-        cv2.circle(wrong, (460, 260), 6, (0, 0, 255), -1)
-        with self.assertRaisesRegex(VisionError, "screw_k0 red-dot"):
-            validate_k0_red_marker(
-                wrong,
-                pose(),
-                patch_radius_px=12,
-                minimum_red_ratio=0.05,
-                minimum_ratio_margin=0.03,
-                minimum_saturation=100,
-                minimum_value=80,
-            )
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -160,7 +160,7 @@ def _read_color_intrinsics(color_frame: object) -> CameraIntrinsics:
 
 
 def _distortion_model_name(value: object) -> str:
-    """Accept the two D435 color models that this geometry layer supports."""
+    """Normalize the D435 color models supported by the geometry layer."""
     text = str(value).strip().lower().replace(" ", "_").replace("-", "_")
     try:
         numeric = int(value)  # type: ignore[arg-type]
@@ -168,10 +168,11 @@ def _distortion_model_name(value: object) -> str:
         numeric = None
     if value is None or numeric == 0 or text in {"0", "none", "distortion.none"}:
         return "none"
+    if numeric == 2 or "inverse_brown_conrady" in text:
+        return "inverse_brown_conrady"
     if numeric == 4 or (
         "brown_conrady" in text
         and "modified_brown_conrady" not in text
-        and "inverse_brown_conrady" not in text
     ):
         return "brown_conrady"
     raise HardwareError(f"D435 彩色畸变模型暂不支持: {value!r}")

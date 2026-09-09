@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import replace
 from pathlib import Path
 import tempfile
 import unittest
@@ -8,20 +7,40 @@ import unittest
 import cv2
 import numpy as np
 
-from tube_grabber.core.errors import VisionError
 from tube_grabber.core.models import Pixel
 from tube_grabber.vision.rack_calibration import (
     RackCircleFitConfig,
+    calibrate_display_corners,
     calibrate_slot_grid,
     fit_slot_circle,
     load_rack_calibration,
     save_rack_calibration,
 )
-from tube_grabber.vision.rack_pose import RackPoseDetection, transform_pixels
 from tests.test_rack_pose import pose
 
 
 class RackCalibrationTests(unittest.TestCase):
+    def test_four_display_corners_follow_detected_screw_homography(self) -> None:
+        calibration = calibrate_slot_grid(
+            "rack_1", pose(), Pixel(150, 150), Pixel(450, 250)
+        )
+        targets = (
+            Pixel(120, 120),
+            Pixel(480, 120),
+            Pixel(480, 280),
+            Pixel(120, 280),
+        )
+        taught = calibrate_display_corners(calibration, pose(), targets)
+        projected = taught.project_display_corners(pose())
+        for actual, expected in zip(projected, targets):
+            self.assertAlmostEqual(actual.u, expected.u, places=4)
+            self.assertAlmostEqual(actual.v, expected.v, places=4)
+
+        shifted = taught.project_display_corners(pose(shift_x=25))
+        for actual, expected in zip(shifted, targets):
+            self.assertAlmostEqual(actual.u, expected.u + 25, places=4)
+            self.assertAlmostEqual(actual.v, expected.v, places=4)
+
     def test_two_diagonal_slots_generate_complete_grid(self) -> None:
         calibration = calibrate_slot_grid(
             "rack_1",
@@ -36,7 +55,7 @@ class RackCalibrationTests(unittest.TestCase):
         self.assertEqual(slots[-1][0].text, "rack_1.r2c6")
         self.assertAlmostEqual(slots[-1][1].v, 250.0, places=4)
 
-    def test_calibration_round_trip_and_normalized_reference_gate(self) -> None:
+    def test_calibration_round_trip(self) -> None:
         calibration = calibrate_slot_grid(
             "rack_1", pose(), Pixel(150, 150), Pixel(450, 250)
         )
@@ -45,18 +64,11 @@ class RackCalibrationTests(unittest.TestCase):
             save_rack_calibration(calibration, path)
             loaded = load_rack_calibration(path, "rack_1")
         self.assertEqual(loaded.slot_unit_points(), calibration.slot_unit_points())
-        loaded.validate_reference_pose(_perspective_pose(), 0.01)
-
-        source = pose()
-        keypoints = list(source.keypoints)
-        screw = keypoints[4]
-        keypoints[4] = replace(
-            screw,
-            pixel=Pixel(screw.pixel.u + 30.0, screw.pixel.v),
+        self.assertEqual(len(loaded.keypoint_names), 4)
+        self.assertEqual(
+            loaded.display_corners_unit,
+            calibration.display_corners_unit,
         )
-        changed = replace(source, keypoints=tuple(keypoints))
-        with self.assertRaisesRegex(VisionError, "normalized layout changed"):
-            loaded.validate_reference_pose(changed, 0.04)
 
     def test_circle_fit_finds_slot_near_approximate_click(self) -> None:
         image = np.zeros((240, 320, 3), dtype=np.uint8)
@@ -78,39 +90,6 @@ class RackCalibrationTests(unittest.TestCase):
         self.assertLess(abs(circle.center.u - 170), 3)
         self.assertLess(abs(circle.center.v - 120), 3)
         self.assertLess(abs(circle.radius_px - 24), 4)
-
-
-def _perspective_pose() -> RackPoseDetection:
-    source = pose()
-    matrix = np.asarray(
-        [
-            [1.10, 0.08, 35.0],
-            [0.04, 0.92, 18.0],
-            [0.00015, 0.00008, 1.0],
-        ],
-        dtype=np.float64,
-    )
-    transformed = transform_pixels(
-        tuple(item.pixel for item in source.keypoints),
-        matrix,
-    )
-    keypoints = tuple(
-        replace(item, pixel=point)
-        for item, point in zip(source.keypoints, transformed)
-    )
-    array = np.asarray([[point.u, point.v] for point in transformed])
-    return replace(
-        source,
-        box=replace(
-            source.box,
-            x1=float(array[:, 0].min()),
-            y1=float(array[:, 1].min()),
-            x2=float(array[:, 0].max()),
-            y2=float(array[:, 1].max()),
-        ),
-        keypoints=keypoints,
-    )
-
 
 if __name__ == "__main__":
     unittest.main()

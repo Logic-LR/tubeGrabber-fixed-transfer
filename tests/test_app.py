@@ -67,9 +67,9 @@ class ApplicationIntegrationTests(unittest.TestCase):
             runtime.arm.pose = Pose6D(  # type: ignore[attr-defined]
                 100.0,
                 320.0,
-                -150.0,
-                -3.0,
-                0.0,
+                40.0,
+                -2.5,
+                0.05,
                 -1.6,
             )
 
@@ -78,7 +78,7 @@ class ApplicationIntegrationTests(unittest.TestCase):
             self.assertEqual(reached, runtime.observation_pose)
             self.assertEqual(  # type: ignore[attr-defined]
                 runtime.arm.moves[-1],
-                (runtime.observation_pose, 10, False),
+                (runtime.observation_pose, 15, False),
             )
         finally:
             runtime.close()

@@ -14,12 +14,12 @@ class ConfigTest(unittest.TestCase):
     def test_default_config_loads(self) -> None:
         config = load_config()
         self.assertEqual(config["runtime"]["mode"], "fake")
-        self.assertEqual(config["vision"]["cap"]["class_names"][0], "tube_cap")
+        self.assertEqual(config["vision"]["cap"]["class_names"][0], "item")
+        self.assertEqual(config["vision"]["screw"]["class_names"][0], "item")
         self.assertEqual(
-            config["vision"]["rack_pose"]["keypoint_names"][:4],
-            ["k0", "k1", "k2", "k3"],
+            config["vision"]["screw"]["model_path"], "models/screw.pt"
         )
-        self.assertEqual(config["geometry"]["grasp_depth_below_cap_mm"], 5.0)
+        self.assertEqual(config["geometry"]["grasp_depth_below_cap_mm"], 28.0)
         self.assertEqual(config["agent"]["provider"], "local")
 
     def test_cpu_inference_is_rejected(self) -> None:

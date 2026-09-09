@@ -15,7 +15,7 @@ from tube_grabber.core.errors import VisionError
 from tube_grabber.core.models import Box, Detection
 
 
-EXPECTED_CLASSES = {0: "tube_cap"}
+CAP_MODEL_CLASSES = {0: "item"}
 
 
 class YoloCapDetector:
@@ -31,9 +31,9 @@ class YoloCapDetector:
         device: str,
     ) -> None:
         normalized_names = {int(key): str(value) for key, value in class_names.items()}
-        if normalized_names != EXPECTED_CLASSES:
+        if normalized_names != CAP_MODEL_CLASSES:
             raise VisionError(
-                f"YOLO classes must be {EXPECTED_CLASSES}"
+                f"cap YOLO classes must be {CAP_MODEL_CLASSES}"
             )
         if not 0.0 < confidence <= 1.0:
             raise VisionError("YOLO confidence must be between 0 and 1")
@@ -82,7 +82,9 @@ class YoloCapDetector:
             )
             detections.append(
                 Detection(
-                    label=self._class_names[class_id],
+                    # Both supplied weights use the generic training label
+                    # ``item``.  Expose the stable application meaning here.
+                    label="tube_cap",
                     confidence=float(boxes.conf[index].item()),
                     box=Box(x1, y1, x2, y2),
                 )

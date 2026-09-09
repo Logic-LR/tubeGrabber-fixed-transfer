@@ -18,6 +18,7 @@ from tube_grabber.core.models import (
     SlotAddress,
     SlotObservation,
     TransferCommand,
+    Waypoint,
 )
 from tube_grabber.core.ports import ArmPort, GripperPort
 from tube_grabber.motion import MotionExecutor, MotionPlanner
@@ -75,6 +76,7 @@ class ManipulationWorkflow:
         scene_recheck_pixel_tolerance_px: float,
         scene_recheck_position_tolerance_mm: float,
         scene_recheck_plane_tolerance_mm: float,
+        destination_recheck_while_carrying: bool = True,
     ) -> None:
         self.arm = arm
         self.gripper = gripper
@@ -106,15 +108,50 @@ class ManipulationWorkflow:
             scene_recheck_plane_tolerance_mm,
             "scene_recheck_plane_tolerance_mm",
         )
+        self.destination_recheck_while_carrying = bool(
+            destination_recheck_while_carrying
+        )
         if self.cap_top_above_rack_mm <= self.grasp_depth_below_cap_mm:
             raise WorkflowError(
                 "cap_top_above_rack_mm must exceed grasp_depth_below_cap_mm"
             )
         self._holding_tube = False
+        self._step_confirmation: Callable[[str], None] | None = None
 
     @property
     def holding_tube(self) -> bool:
         return self._holding_tube
+
+    def set_step_confirmation(
+        self,
+        callback: Callable[[str], None] | None,
+    ) -> None:
+        """Require operator approval before every real scan/action/waypoint."""
+        self._step_confirmation = callback
+        self.executor.set_before_waypoint(
+            None if callback is None else self._confirm_waypoint
+        )
+
+    def set_motion_state_changed(
+        self,
+        callback: Callable[[bool], None] | None,
+    ) -> None:
+        """Expose actual arm-motion boundaries to the recording display."""
+        self.executor.set_motion_state_changed(callback)
+
+    def _confirm(self, description: str) -> None:
+        if self._step_confirmation is not None:
+            self._step_confirmation(description)
+
+    def _confirm_waypoint(self, waypoint: Waypoint) -> None:
+        pose = waypoint.pose
+        motion = "直线" if waypoint.linear else "关节"
+        self._confirm(
+            f"机械臂 {waypoint.name}（{motion}，{waypoint.speed_percent}%）："
+            f"XYZ=[{pose.x_mm:.1f}, {pose.y_mm:.1f}, {pose.z_mm:.1f}] mm，"
+            f"RPY=[{pose.rx_rad:.3f}, {pose.ry_rad:.3f}, "
+            f"{pose.rz_rad:.3f}] rad"
+        )
 
     def move_to_observation_pose(self) -> None:
         """Move to the taught AprilTag-era global observation pose."""
@@ -139,6 +176,7 @@ class ManipulationWorkflow:
     ) -> RackObservation:
         if not rack_id:
             raise WorkflowError("rack_id cannot be empty")
+        self._confirm(f"视觉稳定扫描 {rack_id}（不运动机械臂）")
         task_observer = getattr(self.observer, "observe_rack_for_task", None)
         ordinary_observer = getattr(self.observer, "observe_rack", None)
         if task_observer is not None:
@@ -178,14 +216,23 @@ class ManipulationWorkflow:
         target = self._pick_target(address, observation)
         self.gripper.open_for_pick()
         self.executor.execute(
-            self.planner.plan_approach(self.arm.get_pose(), target)
+            self.planner.plan_approach(
+                self.arm.get_pose(),
+                target,
+                observation.approach_axis_base,
+            )
         )
         # From the moment a close command is sent, treat the payload as held.
         # If communication fails midway, this conservative state prevents a
         # later command from moving the chassis or starting another pick.
         self._holding_tube = True
         self.gripper.grip()
-        self.executor.execute(self.planner.plan_retreat(self.arm.get_pose()))
+        self.executor.execute(
+            self.planner.plan_retreat(
+                self.arm.get_pose(),
+                observation.approach_axis_base,
+            )
+        )
         return target
 
     def place(
@@ -197,11 +244,22 @@ class ManipulationWorkflow:
             raise WorkflowError("cannot place because the gripper holds no tube")
         target = self._place_target(address, observation)
         self.executor.execute(
-            self.planner.plan_approach(self.arm.get_pose(), target)
+            self.planner.plan_approach(
+                self.arm.get_pose(),
+                target,
+                observation.approach_axis_base,
+                destination=True,
+            )
         )
         self.gripper.release()
         self._holding_tube = False
-        self.executor.execute(self.planner.plan_retreat(self.arm.get_pose()))
+        self.executor.execute(
+            self.planner.plan_retreat(
+                self.arm.get_pose(),
+                observation.approach_axis_base,
+                destination=True,
+            )
+        )
         return target
 
     def transfer(self, command: TransferCommand) -> RackObservation:
@@ -234,6 +292,7 @@ class ManipulationWorkflow:
             start_pose,
             source_target,
             destination_target,
+            observation.approach_axis_base,
         )
         return PreparedTransfer(
             command=command,
@@ -291,8 +350,10 @@ class ManipulationWorkflow:
         ):
             current = self.executor.validate(plan, current)
 
+        self._confirm("夹爪张开到抓取预开位置")
         self.gripper.open_for_pick()
         self.executor.execute(prepared.pick_approach)
+        self._confirm("夹爪夹紧试管；确认夹指已对准盖子侧壁")
         self._holding_tube = True
         self.gripper.grip()
         self.executor.execute(prepared.pick_retreat)
@@ -302,27 +363,42 @@ class ManipulationWorkflow:
         destination_corridor = self.planner.plan_above_target(
             self.arm.get_pose(),
             prepared.destination_target,
+            prepared.observation.approach_axis_base,
+            destination=True,
         )
         self.executor.execute(destination_corridor)
 
-        # The wrist camera now re-observes the rack from the safe corridor.
-        # Only the one elevated cap held over the requested destination may be
-        # ignored; all seated caps and every other mismatch remain blocking.
-        destination_observation = self._recheck_destination_while_carrying(
-            prepared
-        )
-        destination_target = self._place_target(
-            prepared.command.destination,
-            destination_observation,
-        )
+        if self.destination_recheck_while_carrying:
+            # Optional only when this camera pose can still see all four rack
+            # screws. The current wrist view cannot, so real configuration
+            # reuses the final complete pre-grasp observation instead.
+            destination_observation = self._recheck_destination_while_carrying(
+                prepared
+            )
+            destination_target = self._place_target(
+                prepared.command.destination,
+                destination_observation,
+            )
+        else:
+            destination_observation = prepared.observation
+            destination_target = prepared.destination_target
         place_approach = self.planner.plan_approach(
             self.arm.get_pose(),
             destination_target,
+            destination_observation.approach_axis_base,
+            destination=True,
         )
         self.executor.execute(place_approach)
+        self._confirm("夹爪释放试管；确认试管已进入目标槽")
         self.gripper.release()
         self._holding_tube = False
-        self.executor.execute(self.planner.plan_retreat(self.arm.get_pose()))
+        self.executor.execute(
+            self.planner.plan_retreat(
+                self.arm.get_pose(),
+                destination_observation.approach_axis_base,
+                destination=True,
+            )
+        )
 
         # Reuse the AprilTag-era global observation pose only after releasing
         # the payload; carrying a 120 mm tube into this lower pose is forbidden.
@@ -507,8 +583,10 @@ class ManipulationWorkflow:
             )
         if slot.cap_top_base is None:
             raise WorkflowError(f"source {address.text} has no cap coordinate")
-        return slot.cap_top_base.shifted(
-            dz_mm=-self.grasp_depth_below_cap_mm
+        return _shift_along(
+            slot.cap_top_base,
+            observation.approach_axis_base,
+            -self.grasp_depth_below_cap_mm,
         )
 
     def _place_target(
@@ -523,19 +601,15 @@ class ManipulationWorkflow:
             )
         if slot.hole_on_plane_base is None:
             raise WorkflowError(f"destination {address.text} has no hole coordinate")
-        _finite(observation.plane_z_mm, "rack plane_z_mm")
         hole = slot.hole_on_plane_base
-        target_z_mm = (
-            hole.z_mm
-            + self.cap_top_above_rack_mm
-            - self.grasp_depth_below_cap_mm
-            + self.seating_adjust_mm
-        )
-        return Point3D(
-            hole.x_mm,
-            hole.y_mm,
-            target_z_mm,
-            hole.frame,
+        return _shift_along(
+            hole,
+            observation.approach_axis_base,
+            (
+                self.cap_top_above_rack_mm
+                - self.grasp_depth_below_cap_mm
+                + self.seating_adjust_mm
+            ),
         )
 
     @staticmethod
@@ -557,18 +631,29 @@ class ManipulationWorkflow:
         current: Pose6D,
         source_target: Point3D,
         destination_target: Point3D,
+        approach_axis_base: tuple[float, float, float],
     ) -> tuple[MotionPlan, MotionPlan, MotionPlan, MotionPlan]:
         """Build and validate preview segments without moving the arm."""
-        source_approach = self.planner.plan_approach(current, source_target)
+        source_approach = self.planner.plan_approach(
+            current,
+            source_target,
+            approach_axis_base,
+        )
         current = self.executor.validate(source_approach, current)
-        source_retreat = self.planner.plan_retreat(current)
+        source_retreat = self.planner.plan_retreat(current, approach_axis_base)
         current = self.executor.validate(source_retreat, current)
         destination_approach = self.planner.plan_approach(
             current,
             destination_target,
+            approach_axis_base,
+            destination=True,
         )
         current = self.executor.validate(destination_approach, current)
-        destination_retreat = self.planner.plan_retreat(current)
+        destination_retreat = self.planner.plan_retreat(
+            current,
+            approach_axis_base,
+            destination=True,
+        )
         self.executor.validate(destination_retreat, current)
         return (
             source_approach,
@@ -583,6 +668,23 @@ def _finite(value: float, name: str) -> float:
     if not math.isfinite(result):
         raise WorkflowError(f"{name} must be finite")
     return result
+
+
+def _shift_along(
+    point: Point3D,
+    axis: tuple[float, float, float],
+    distance_mm: float,
+) -> Point3D:
+    length = math.sqrt(sum(float(value) ** 2 for value in axis))
+    if not math.isfinite(length) or length <= 1e-9:
+        raise WorkflowError("approach_axis_base is invalid")
+    scale = float(distance_mm) / length
+    return Point3D(
+        point.x_mm + scale * float(axis[0]),
+        point.y_mm + scale * float(axis[1]),
+        point.z_mm + scale * float(axis[2]),
+        point.frame,
+    )
 
 
 def _positive(value: float, name: str) -> float:

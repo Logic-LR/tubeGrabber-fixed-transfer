@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import math
 from math import isfinite
 
 
@@ -76,9 +77,14 @@ class CameraIntrinsics:
             raise ValueError("camera intrinsics must be finite")
         if self.fx <= 0 or self.fy <= 0:
             raise ValueError("camera focal lengths must be positive")
-        if self.distortion_model not in {"none", "brown_conrady"}:
+        if self.distortion_model not in {
+            "none",
+            "brown_conrady",
+            "inverse_brown_conrady",
+        }:
             raise ValueError(
-                "camera distortion model must be none or brown_conrady"
+                "camera distortion model must be none, brown_conrady, "
+                "or inverse_brown_conrady"
             )
         if (
             self.distortion_model == "brown_conrady"
@@ -86,6 +92,14 @@ class CameraIntrinsics:
         ):
             raise ValueError(
                 "brown_conrady distortion requires OpenCV-compatible coefficients"
+            )
+        if (
+            self.distortion_model == "inverse_brown_conrady"
+            and len(self.distortion_coefficients) != 5
+        ):
+            raise ValueError(
+                "inverse_brown_conrady distortion requires five RealSense "
+                "coefficients"
             )
 
 
@@ -208,6 +222,10 @@ class RackObservation:
     stability_frame_count: int = 1
     maximum_keypoint_spread_px: float = 0.0
     maximum_position_spread_mm: float = 0.0
+    # Unit vector from the rack surface toward the camera/safe space, expressed
+    # in base_right.  The RM75 base is installed at 45 degrees, so this is not
+    # generally base +Z.
+    approach_axis_base: tuple[float, float, float] = (0.0, 0.0, 1.0)
 
     def __post_init__(self) -> None:
         if not self.rack_id:
@@ -226,8 +244,17 @@ class RackObservation:
             or self.maximum_position_spread_mm < 0.0
         ):
             raise ValueError("rack stability values cannot be negative")
-        if self.rack_keypoints and len(self.rack_keypoints) != 8:
-            raise ValueError("rack_keypoints must be empty or contain eight points")
+        if len(self.approach_axis_base) != 3 or not _finite(
+            *self.approach_axis_base
+        ):
+            raise ValueError("approach_axis_base must contain three finite values")
+        axis_length = math.sqrt(
+            sum(float(value) ** 2 for value in self.approach_axis_base)
+        )
+        if abs(axis_length - 1.0) > 1e-3:
+            raise ValueError("approach_axis_base must be a unit vector")
+        if self.rack_keypoints and len(self.rack_keypoints) != 4:
+            raise ValueError("rack_keypoints must be empty or contain four points")
         if len(self.slots) != 12:
             raise ValueError("a 2x6 rack observation must contain 12 slots")
         addresses = [slot.address for slot in self.slots]

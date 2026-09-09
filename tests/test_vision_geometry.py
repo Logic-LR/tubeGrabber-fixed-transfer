@@ -83,6 +83,28 @@ class DepthAndGeometryTests(unittest.TestCase):
         self.assertAlmostEqual(measured.y_mm, 0.0)
         self.assertAlmostEqual(measured.z_mm, 100.0)
 
+    def test_inverse_brown_conrady_matches_realsense_deprojection(self) -> None:
+        intrinsics = CameraIntrinsics(
+            fx=600.0,
+            fy=610.0,
+            cx=640.0,
+            cy=360.0,
+            distortion_model="inverse_brown_conrady",
+            distortion_coefficients=(0.1, -0.02, 0.003, -0.004, 0.005),
+        )
+        measured = pixel_depth_to_base(
+            Pixel(900.0, 500.0),
+            100.0,
+            intrinsics,
+            np.eye(4),
+        )
+
+        # Reference from librealsense 2.56.5
+        # rs2_deproject_pixel_to_point(..., [900, 500], 1.0).
+        self.assertAlmostEqual(measured.x_mm, 42.570944, places=3)
+        self.assertAlmostEqual(measured.y_mm, 22.430849, places=3)
+        self.assertAlmostEqual(measured.z_mm, 100.0)
+
 
 if __name__ == "__main__":
     unittest.main()

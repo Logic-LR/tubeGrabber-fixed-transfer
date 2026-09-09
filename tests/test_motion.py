@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import math
 import unittest
+from unittest.mock import patch
 
 from tube_grabber.core.errors import MotionError
 from tube_grabber.core.models import MotionPlan, Point3D, Pose6D, Waypoint
@@ -17,14 +19,12 @@ class MotionPlannerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.planner = MotionPlanner(
             tcp_offset_end_mm=(0.0, 0.0, 10.0),
-            vertical_tool_rpy_rad=(0.0, 0.0, 0.0),
             approach_height_mm=20.0,
             retreat_height_mm=30.0,
             transit_speed_percent=10,
             approach_speed_percent=5,
-            maximum_orientation_error_deg=5,
             maximum_single_orientation_change_deg=30,
-            maximum_tool_tilt_deg=180,
+            maximum_tool_axis_misalignment_deg=15,
             tube_total_length_mm=20,
             required_carried_clearance_mm=10,
         )
@@ -44,11 +44,11 @@ class MotionPlannerTests(unittest.TestCase):
         self.assertAlmostEqual(restored.y_mm, flange.y_mm)
         self.assertAlmostEqual(restored.z_mm, flange.z_mm)
 
-    def test_approach_lifts_then_descends_vertically(self) -> None:
-        current = Pose6D(0, 0, 0, 0, 0, 0)
+    def test_approach_lifts_then_descends_along_rack_normal(self) -> None:
+        current = Pose6D(0, 0, 0, math.pi, 0, 0)
         target = Point3D(100, 80, 0)
 
-        plan = self.planner.plan_approach(current, target)
+        plan = self.planner.plan_approach(current, target, (0, 0, 1))
         tcp_points = [
             flange_to_tcp_point(waypoint.pose, (0, 0, 10))
             for waypoint in plan.waypoints
@@ -58,25 +58,58 @@ class MotionPlannerTests(unittest.TestCase):
             [waypoint.name for waypoint in plan.waypoints],
             ["lift", "above_target", "descend"],
         )
-        self.assertEqual(tcp_points[0], Point3D(0, 0, 20))
-        self.assertEqual(tcp_points[1], Point3D(100, 80, 20))
-        self.assertEqual(tcp_points[2], target)
+        for actual, expected in zip(
+            tcp_points,
+            (Point3D(0, 0, 20), Point3D(100, 80, 20), target),
+        ):
+            self.assertAlmostEqual(actual.x_mm, expected.x_mm)
+            self.assertAlmostEqual(actual.y_mm, expected.y_mm)
+            self.assertAlmostEqual(actual.z_mm, expected.z_mm)
         self.assertEqual(tcp_points[1].x_mm, tcp_points[2].x_mm)
         self.assertEqual(tcp_points[1].y_mm, tcp_points[2].y_mm)
         self.assertTrue(all(waypoint.linear for waypoint in plan.waypoints))
 
+    def test_approach_uses_tilted_rack_normal_instead_of_base_z(self) -> None:
+        axis = (-2**-0.5, 0.0, 2**-0.5)
+        current = Pose6D(
+            -100.0 * axis[0],
+            0,
+            -100.0 * axis[2],
+            math.pi,
+            -math.pi / 4,
+            0,
+        )
+        target = Point3D(100, 80, 0)
+
+        plan = self.planner.plan_approach(current, target, axis)
+        above = flange_to_tcp_point(plan.waypoints[-2].pose, (0, 0, 10))
+        descend = flange_to_tcp_point(plan.waypoints[-1].pose, (0, 0, 10))
+        delta = (
+            above.x_mm - descend.x_mm,
+            above.y_mm - descend.y_mm,
+            above.z_mm - descend.z_mm,
+        )
+
+        self.assertAlmostEqual(delta[0], axis[0] * 20.0, places=6)
+        self.assertAlmostEqual(delta[1], axis[1] * 20.0, places=6)
+        self.assertAlmostEqual(delta[2], axis[2] * 20.0, places=6)
+
     def test_retreat_moves_tcp_up(self) -> None:
-        current = Pose6D(100, 80, -10, 0, 0, 0)
-        plan = self.planner.plan_retreat(current)
+        current = Pose6D(100, 80, 10, math.pi, 0, 0)
+        plan = self.planner.plan_retreat(current, (0, 0, 1))
         tcp = flange_to_tcp_point(plan.waypoints[0].pose, (0, 0, 10))
         self.assertEqual(tcp, Point3D(100, 80, 30))
         self.assertTrue(plan.waypoints[0].linear)
 
-    def test_approach_rejects_non_vertical_start_pose(self) -> None:
-        current = Pose6D(0, 0, 40, 0.2, 0, 0)
+    def test_approach_rejects_large_tool_axis_error(self) -> None:
+        current = Pose6D(0, 0, 40, math.pi - 0.5, 0, 0)
 
-        with self.assertRaisesRegex(MotionError, "orientation"):
-            self.planner.plan_approach(current, Point3D(100, 80, 0))
+        with self.assertRaisesRegex(MotionError, "tool axis"):
+            self.planner.plan_approach(
+                current,
+                Point3D(100, 80, 0),
+                (0, 0, 1),
+            )
 
     def test_taught_pose_move_rejects_a_large_orientation_change(self) -> None:
         with self.assertRaisesRegex(MotionError, "orientation change"):
@@ -86,34 +119,24 @@ class MotionPlannerTests(unittest.TestCase):
                 name="observation_pose",
             )
 
-    def test_upward_tool_configuration_is_rejected(self) -> None:
-        with self.assertRaisesRegex(MotionError, r"tool \+Z"):
-            MotionPlanner(
-                tcp_offset_end_mm=(0.0, 0.0, 10.0),
-                vertical_tool_rpy_rad=(0.0, 0.0, 0.0),
-                approach_height_mm=20.0,
-                retreat_height_mm=30.0,
-                transit_speed_percent=10,
-                approach_speed_percent=5,
-                maximum_orientation_error_deg=5,
-                maximum_single_orientation_change_deg=30,
-                maximum_tool_tilt_deg=1,
-                tube_total_length_mm=20,
-                required_carried_clearance_mm=10,
+    def test_wrong_tool_axis_is_rejected(self) -> None:
+        with self.assertRaisesRegex(MotionError, "tool axis"):
+            self.planner.plan_approach(
+                Pose6D(0, 0, 0, 0, 0, 0),
+                Point3D(0, 0, 0),
+                (0, 0, 1),
             )
 
     def test_retreat_must_clear_the_full_carried_tube(self) -> None:
         with self.assertRaisesRegex(MotionError, "minimum is 30.0 mm"):
             MotionPlanner(
                 tcp_offset_end_mm=(0.0, 0.0, 10.0),
-                vertical_tool_rpy_rad=(0.0, 0.0, 0.0),
                 approach_height_mm=20.0,
                 retreat_height_mm=29.0,
                 transit_speed_percent=10,
                 approach_speed_percent=5,
-                maximum_orientation_error_deg=5,
                 maximum_single_orientation_change_deg=30,
-                maximum_tool_tilt_deg=180,
+                maximum_tool_axis_misalignment_deg=15,
                 tube_total_length_mm=20,
                 required_carried_clearance_mm=10,
             )
@@ -144,6 +167,72 @@ class MotionExecutorTests(unittest.TestCase):
 
         self.assertEqual(len(arm.moves), 2)
         self.assertEqual(arm.pose, plan.waypoints[-1].pose)
+
+    def test_motion_state_callback_wraps_each_actual_arm_move(self) -> None:
+        arm = FakeArm(Pose6D(0, 0, 0, 0, 0, 0))
+        arm.connect()
+        states: list[bool] = []
+        executor = self._executor(arm)
+        executor.set_motion_state_changed(states.append)
+        plan = MotionPlan(
+            (
+                Waypoint("same", arm.pose, 5),
+                Waypoint("first", Pose6D(10, 0, 0, 0, 0, 0), 5),
+                Waypoint("second", Pose6D(20, 0, 0, 0, 0, 0), 5),
+            )
+        )
+
+        executor.execute(plan)
+
+        self.assertEqual(states, [True, False, True, False])
+
+    def test_waits_for_settle_before_reached_pose_check(self) -> None:
+        arm = FakeArm(Pose6D(0, 0, 0, 0, 0, 0))
+        arm.connect()
+        executor = MotionExecutor(
+            arm,
+            workspace_min_mm=(-100, -100, -100),
+            workspace_max_mm=(200, 200, 200),
+            maximum_single_move_mm=200,
+            reached_check_settle_s=1.0,
+            position_reached_tolerance_mm=1.0,
+            orientation_reached_tolerance_deg=0.5,
+        )
+
+        with patch("tube_grabber.motion.executor.time.sleep") as sleep:
+            executor.execute(
+                MotionPlan(
+                    (Waypoint("move", Pose6D(10, 0, 0, 0, 0, 0), 5),)
+                )
+            )
+
+        sleep.assert_called_once_with(1.0)
+
+    def test_motion_state_is_cleared_when_arm_move_fails(self) -> None:
+        class FailingArm(FakeArm):
+            def move_pose(
+                self,
+                pose: Pose6D,
+                speed_percent: int,
+                *,
+                linear: bool = False,
+            ) -> None:
+                raise RuntimeError("simulated controller failure")
+
+        arm = FailingArm(Pose6D(0, 0, 0, 0, 0, 0))
+        arm.connect()
+        states: list[bool] = []
+        executor = self._executor(arm)
+        executor.set_motion_state_changed(states.append)
+
+        with self.assertRaises(MotionError):
+            executor.execute(
+                MotionPlan(
+                    (Waypoint("fail", Pose6D(10, 0, 0, 0, 0, 0), 5),)
+                )
+            )
+
+        self.assertEqual(states, [True, False])
 
     def test_rejects_entire_plan_before_first_move(self) -> None:
         arm = FakeArm(Pose6D(0, 0, 0, 0, 0, 0))

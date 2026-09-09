@@ -18,6 +18,11 @@ def format_observation(observation: RackObservation) -> str:
     lines = [
         f"rack={observation.rack_id}  plane_z={observation.plane_z_mm:.2f} mm",
         (
+            "rack_up_base=["
+            + ", ".join(f"{value:+.5f}" for value in observation.approach_axis_base)
+            + "]"
+        ),
+        (
             f"stable_frames={observation.stability_frame_count}  "
             f"keypoint_spread={observation.maximum_keypoint_spread_px:.2f}px  "
             f"position_spread={observation.maximum_position_spread_mm:.2f}mm"
@@ -151,7 +156,7 @@ def save_observation_image(
             if slot.occupancy is Occupancy.OCCUPIED
             else (0, 200, 0)
         )
-        cv2.circle(image, center, 8, color, 2)
+        cv2.circle(image, center, 5, color, 1, cv2.LINE_AA)
         cv2.putText(
             image,
             f"r{slot.address.row}c{slot.address.column}",
@@ -167,22 +172,17 @@ def save_observation_image(
         "k1",
         "k2",
         "k3",
-        "screw_k0",
-        "screw_k1",
-        "screw_k2",
-        "screw_k3",
     )
-    keypoints = observation.rack_keypoints or (observation.marker,)
+    keypoints = observation.rack_keypoints
+    if len(keypoints) == 4:
+        polygon = np.asarray(
+            [[round(point.u), round(point.v)] for point in keypoints],
+            dtype=np.int32,
+        )
+        cv2.polylines(image, [polygon], True, (255, 0, 255), 1, cv2.LINE_AA)
     for name, point in zip(keypoint_names, keypoints):
         center = (int(round(point.u)), int(round(point.v)))
-        cv2.drawMarker(
-            image,
-            center,
-            (255, 0, 255),
-            cv2.MARKER_CROSS,
-            18,
-            2,
-        )
+        cv2.circle(image, center, 4, (255, 0, 255), 1, cv2.LINE_AA)
         cv2.putText(
             image,
             name,

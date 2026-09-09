@@ -70,7 +70,7 @@ class ManipulationWorkflowTests(unittest.TestCase):
         workspace_max_x_mm: float = 250.0,
     ) -> tuple[ManipulationWorkflow, FakeArm, FakeGripper, FakeRackObserver]:
         arm = FakeArm(
-            Pose6D(0, 0, 90, 0, 0, 0),
+            Pose6D(0, 0, 90, 3.141592653589793, 0, 0),
             fail_on_move_number=fail_on_move_number,
         )
         arm.connect()
@@ -79,14 +79,12 @@ class ManipulationWorkflowTests(unittest.TestCase):
         observer = FakeRackObserver(observation)
         planner = MotionPlanner(
             tcp_offset_end_mm=(0, 0, 10),
-            vertical_tool_rpy_rad=(0, 0, 0),
             approach_height_mm=20,
             retreat_height_mm=30,
             transit_speed_percent=10,
             approach_speed_percent=5,
-            maximum_orientation_error_deg=5,
             maximum_single_orientation_change_deg=180,
-            maximum_tool_tilt_deg=180,
+            maximum_tool_axis_misalignment_deg=90,
             tube_total_length_mm=20,
             required_carried_clearance_mm=10,
         )

@@ -23,6 +23,7 @@ class _GripperStatus:
     error: int
     mode: int
     position: int
+    speed: int
     current_force: int
 
 
@@ -30,6 +31,10 @@ class RealManGripper:
     def __init__(
         self,
         arm: RealManArm,
+        baudrate: int = 9600,
+        tool_voltage: int = 3,
+        speed: int = 100,
+        force: int = 30,
         open_position: int = 170,
         grip_position: int = 135,
         reset_position: int = 1,
@@ -39,11 +44,21 @@ class RealManGripper:
         poll_interval_s: float = 0.1,
         state_read_attempts: int = 6,
         state_read_retry_s: float = 0.25,
+        power_on_wait_s: float = 1.0,
+        protocol_startup_wait_s: float = 0.8,
     ) -> None:
         if command_timeout_s <= 0:
             raise ValueError("command_timeout_s 必须大于 0")
 
         self.arm = arm
+        self.baudrate = int(baudrate)
+        if self.baudrate not in (9600, 115200, 256000, 460800):
+            raise ValueError("baudrate 不是 SDK 支持的 RM Plus 波特率")
+        self.tool_voltage = int(tool_voltage)
+        if self.tool_voltage not in (0, 2, 3):
+            raise ValueError("tool_voltage 必须为 0、2 或 3")
+        self.speed = _valid_setting(speed, "speed", maximum=5000)
+        self.force = _valid_setting(force, "force", maximum=100)
         self.open_position = _valid_position(open_position, "open_position")
         self.grip_position = _valid_position(grip_position, "grip_position")
         self.reset_position = _valid_position(reset_position, "reset_position")
@@ -66,18 +81,42 @@ class RealManGripper:
             state_read_retry_s,
             "state_read_retry_s",
         )
+        self.power_on_wait_s = _nonnegative_finite(
+            power_on_wait_s,
+            "power_on_wait_s",
+        )
+        self.protocol_startup_wait_s = _nonnegative_finite(
+            protocol_startup_wait_s,
+            "protocol_startup_wait_s",
+        )
         self._ready = False
 
     def setup(self) -> None:
         robot = self.arm.sdk_robot
         for method_name in (
-            "rm_set_gripper_position",
-            "rm_get_gripper_state",
+            "rm_set_tool_voltage",
+            "rm_set_rm_plus_mode",
+            "rm_get_rm_plus_state_info",
+            "rm_set_hand_force",
+            "rm_set_hand_speed",
+            "rm_set_hand_follow_pos",
         ):
             if not hasattr(robot, method_name):
                 raise HardwareError(f"当前 RealMan SDK 不支持 {method_name}")
 
         self._ready = False
+        call_and_require(
+            "设置工具端 24V",
+            robot.rm_set_tool_voltage,
+            self.tool_voltage,
+        )
+        time.sleep(self.power_on_wait_s)
+        call_and_require(
+            f"设置 RM Plus {self.baudrate} 波特率",
+            robot.rm_set_rm_plus_mode,
+            self.baudrate,
+        )
+        time.sleep(self.protocol_startup_wait_s)
         self._require_ready_status(self._read_status())
         self._ready = True
 
@@ -106,30 +145,59 @@ class RealManGripper:
     ) -> None:
         if not self._ready:
             raise HardwareError("夹爪尚未初始化，请先调用 setup()")
+        before = self._read_status()
+        call_and_require(
+            "设置 RM Plus 夹爪力限幅",
+            self.arm.sdk_robot.rm_set_hand_force,
+            self.force,
+        )
+        call_and_require(
+            "设置 RM Plus 夹爪速度",
+            self.arm.sdk_robot.rm_set_hand_speed,
+            self.speed,
+        )
+        command = [position, -1, -1, -1, -1, -1]
         call_and_require(
             operation,
-            self.arm.sdk_robot.rm_set_gripper_position,
-            position,
-            True,
-            self.command_timeout_s,
+            self.arm.sdk_robot.rm_set_hand_follow_pos,
+            command,
+            False,
         )
 
         deadline = time.monotonic() + self.command_timeout_s
         settled_samples = 0
-        last: _GripperStatus | None = None
+        stopped_fault_samples = 0
+        movement_seen = abs(before.position - position) <= self.position_tolerance
+        last = before
         while time.monotonic() <= deadline:
             last = self._read_status()
             self._require_ready_status(last)
+            if abs(last.position - before.position) >= self.position_tolerance:
+                movement_seen = True
+            if last.mode in {5, 6}:
+                settled_samples = 0
+                if last.speed == 0:
+                    stopped_fault_samples += 1
+                    if stopped_fault_samples >= 3:
+                        raise HardwareError(
+                            f"{operation} 时夹爪连续处于保护或故障状态"
+                        )
+                else:
+                    stopped_fault_samples = 0
+                time.sleep(self.poll_interval_s)
+                continue
+
+            stopped_fault_samples = 0
             position_reached = (
                 abs(last.position - position) <= self.position_tolerance
             )
-            gripping_object = (
+            force_stopped = (
                 accept_force_stop
-                and last.mode == 6
+                and last.mode == 3
                 and last.current_force > 0
             )
-            terminal = last.mode in {1, 2, 3, 6}
-            if terminal and (position_reached or gripping_object):
+            terminal = (last.mode == 2 and position_reached) or force_stopped
+            if movement_seen and terminal and last.speed == 0:
                 settled_samples += 1
                 if settled_samples >= 3:
                     return
@@ -137,12 +205,8 @@ class RealManGripper:
                 settled_samples = 0
             time.sleep(self.poll_interval_s)
         detail = (
-            "unavailable"
-            if last is None
-            else (
-                f"actual={last.position}, mode={last.mode}, "
-                f"force={last.current_force}"
-            )
+            f"actual={last.position}, mode={last.mode}, "
+            f"speed={last.speed}, force={last.current_force}"
         )
         raise HardwareError(
             f"{operation} 后反馈未稳定：target={position}, {detail}, "
@@ -160,16 +224,17 @@ class RealManGripper:
 
     def _read_status(self) -> _GripperStatus:
         state = self._read_state_with_retries()
+        system_error = _integer(state.get("sys_state", 0), "sys_state")
+        dof_error = _first_integer(state.get("dof_err"), "dof_err")
+        error = system_error if system_error else dof_error
         return _GripperStatus(
-            enabled=bool(_integer(state.get("enable_state"), "enable_state")),
-            online=bool(_integer(state.get("status"), "status")),
-            error=_integer(state.get("error"), "error"),
-            mode=_integer(state.get("mode"), "mode"),
-            position=_integer(state.get("actpos"), "actpos"),
-            current_force=_integer(
-                state.get("current_force"),
-                "current_force",
-            ),
+            enabled=error == 0,
+            online=True,
+            error=error,
+            mode=_first_integer(state.get("dof_state"), "dof_state"),
+            position=_first_integer(state.get("pos"), "pos"),
+            speed=_first_integer(state.get("speed"), "speed"),
+            current_force=_first_integer(state.get("force"), "force"),
         )
 
     def _read_state_with_retries(self) -> Mapping[str, object]:
@@ -189,7 +254,7 @@ class RealManGripper:
     def _read_state(self) -> Mapping[str, object]:
         result = call_sdk(
             "读取两指夹爪状态",
-            self.arm.sdk_robot.rm_get_gripper_state,
+            self.arm.sdk_robot.rm_get_rm_plus_state_info,
         )
         require_success("读取两指夹爪状态", result)
         if (
@@ -206,6 +271,13 @@ def _valid_position(value: int, name: str) -> int:
     if not 1 <= position <= 1000:
         raise ValueError(f"{name} 必须在 1..1000")
     return position
+
+
+def _valid_setting(value: int, name: str, *, maximum: int) -> int:
+    result = int(value)
+    if not 1 <= result <= maximum:
+        raise ValueError(f"{name} 必须在 1..{maximum}")
+    return result
 
 
 def _nonnegative_finite(value: float, name: str) -> float:
@@ -227,3 +299,11 @@ def _integer(value: object, name: str) -> int:
         return int(value)
     except (TypeError, ValueError) as exc:
         raise HardwareError(f"两指夹爪状态 {name} 无效: {value!r}") from exc
+
+
+def _first_integer(value: object, name: str) -> int:
+    if isinstance(value, (list, tuple)):
+        if not value:
+            raise HardwareError(f"两指夹爪状态 {name} 为空")
+        value = value[0]
+    return _integer(value, name)

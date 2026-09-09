@@ -62,6 +62,7 @@ class RackPlaneFitConfig:
     minimum_inlier_ratio: float
     maximum_rms_error_mm: float
     maximum_tilt_deg: float
+    expected_normal_base: tuple[float, float, float] = (0.0, 0.0, -1.0)
 
     def __post_init__(self) -> None:
         numeric_values = (
@@ -82,6 +83,11 @@ class RackPlaneFitConfig:
             raise ValueError("minimum_inlier_ratio must be in (0, 1]")
         if self.maximum_rms_error_mm <= 0.0 or self.maximum_tilt_deg <= 0.0:
             raise ValueError("rack plane RMS/tilt limits must be positive")
+        expected = np.asarray(self.expected_normal_base, dtype=np.float64)
+        if expected.shape != (3,) or not np.isfinite(expected).all():
+            raise ValueError("expected_normal_base must contain three finite values")
+        if abs(float(np.linalg.norm(expected)) - 1.0) > 1e-3:
+            raise ValueError("expected_normal_base must be a unit vector")
 
 
 def fit_rack_plane(
@@ -94,7 +100,7 @@ def fit_rack_plane(
     depth_max_mm: float,
     config: RackPlaneFitConfig,
 ) -> RackPlane:
-    """Fit the physical top surface while excluding caps, holes and edges."""
+    """Fit the physical top surface while excluding caps, corners and edges."""
     depth = np.asarray(frame.depth_mm, dtype=np.float64)
     if depth.ndim != 2:
         raise VisionError("aligned depth image must be two-dimensional")
@@ -179,10 +185,13 @@ def fit_rack_plane(
         raise VisionError(
             f"rack plane RMS {rms:.3f}mm exceeds {config.maximum_rms_error_mm:.3f}mm"
         )
-    tilt = degrees(acos(float(np.clip(abs(normal[2]), 0.0, 1.0))))
+    expected = np.asarray(config.expected_normal_base, dtype=np.float64)
+    expected /= np.linalg.norm(expected)
+    tilt = degrees(acos(float(np.clip(np.dot(normal, expected), -1.0, 1.0))))
     if tilt > float(config.maximum_tilt_deg):
         raise VisionError(
-            f"rack plane tilt {tilt:.2f}deg exceeds {config.maximum_tilt_deg:.2f}deg"
+            "rack plane normal differs from the configured physical-up axis "
+            f"by {tilt:.2f}deg; maximum is {config.maximum_tilt_deg:.2f}deg"
         )
     return RackPlane(
         normal_base=tuple(float(value) for value in normal),
@@ -202,7 +211,10 @@ def _pixels_depth_to_base(
 ) -> np.ndarray:
     intrinsics = frame.intrinsics
     pixels = np.column_stack((columns, rows)).astype(np.float64)
-    if intrinsics.distortion_model == "brown_conrady" and any(
+    if intrinsics.distortion_model in {
+        "brown_conrady",
+        "inverse_brown_conrady",
+    } and any(
         abs(value) > 1e-12 for value in intrinsics.distortion_coefficients
     ):
         camera_matrix = np.asarray(

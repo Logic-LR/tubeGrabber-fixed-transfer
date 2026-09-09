@@ -38,7 +38,7 @@ class _Result:
 
 
 class _Model:
-    names = {0: "tube_cap"}
+    names = {0: "item"}
 
     def predict(self, **kwargs: object) -> list[_Result]:
         return [_Result()]
@@ -48,7 +48,7 @@ class YoloCapDetectorTests(unittest.TestCase):
     def test_model_import_and_load_are_lazy(self) -> None:
         detector = YoloCapDetector(
             "model_does_not_need_to_exist_yet.pt",
-            {0: "tube_cap"},
+            {0: "item"},
             0.45,
             0.45,
             1280,
@@ -66,7 +66,7 @@ class YoloCapDetectorTests(unittest.TestCase):
         self.assertEqual(detections[0].box.center.v, 30.0)
 
     def test_wrong_class_contract_is_rejected(self) -> None:
-        with self.assertRaisesRegex(VisionError, "YOLO classes"):
+        with self.assertRaisesRegex(VisionError, "cap YOLO classes"):
             YoloCapDetector(
                 "model.pt",
                 {0: "cap"},

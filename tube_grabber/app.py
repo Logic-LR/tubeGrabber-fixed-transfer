@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from threading import RLock
 from typing import Any
 
 from tube_grabber.config import load_yaml, project_path
@@ -30,12 +31,14 @@ from tube_grabber.vision.pose_pipeline import (
     PoseRackVision,
     RackMatchingConfig,
     RackStabilityConfig,
+    RackVisualDetection,
 )
 from tube_grabber.vision.rack_calibration import load_rack_calibration
 from tube_grabber.vision.rack_pose import (
     RackPoseQualityConfig,
     RackPoseStability,
-    YoloRackPoseDetector,
+    ScrewMarkerConfig,
+    YoloScrewRackDetector,
 )
 from tube_grabber.workflow import ManipulationWorkflow
 
@@ -55,6 +58,10 @@ class CameraRackObserver:
         self.last_frame: CameraFrame | None = None
         self.last_observation: RackObservation | None = None
         self.last_pose_stability: RackPoseStability | None = None
+        # RealSense capture and both YOLO models are shared by stable scans and
+        # the transfer recording window. Keep a complete perception operation
+        # exclusive so frames and model calls can never overlap.
+        self._perception_lock = RLock()
 
     def observe_rack(self, rack_id: str) -> RackObservation:
         return self.observe_rack_for_task(rack_id)
@@ -65,27 +72,53 @@ class CameraRackObserver:
         *,
         ignored_elevated_slot: SlotAddress | None = None,
     ) -> RackObservation:
-        samples = self._capture_samples()
-        observation = self.vision.observe(
-            samples,
-            rack_id,
-            ignored_elevated_slot=ignored_elevated_slot,
-        )
-        self.last_frame = min(
-            samples,
-            key=lambda item: abs(item.frame.timestamp_ms - observation.timestamp_ms),
-        ).frame
-        self.last_observation = observation
-        return observation
+        with self._perception_lock:
+            samples = self._capture_samples()
+            observation = self.vision.observe(
+                samples,
+                rack_id,
+                ignored_elevated_slot=ignored_elevated_slot,
+            )
+            self.last_frame = min(
+                samples,
+                key=lambda item: abs(
+                    item.frame.timestamp_ms - observation.timestamp_ms
+                ),
+            ).frame
+            self.last_observation = observation
+            return observation
 
     def capture_stable_pose(self) -> tuple[CameraFrame, RackPoseStability]:
         """Capture the same filtered rack pose used by interactive calibration."""
-        samples = self._capture_samples()
-        stability, _ = self.vision.detect_stable_pose(samples)
-        frame = samples[stability.inlier_indices[-1]].frame
-        self.last_frame = frame
-        self.last_pose_stability = stability
-        return frame, stability
+        with self._perception_lock:
+            samples = self._capture_samples()
+            stability, _ = self.vision.detect_stable_pose(samples)
+            frame = samples[stability.inlier_indices[-1]].frame
+            self.last_frame = frame
+            self.last_pose_stability = stability
+            return frame, stability
+
+    def capture_visual(self, rack_id: str) -> tuple[CameraFrame, RackVisualDetection]:
+        """Capture one frame for the live 2D scan overlay."""
+        with self._perception_lock:
+            frame = self.camera.capture()
+            visual = self.vision.detect_visual(frame.color, rack_id)
+            self.last_frame = frame
+            return frame, visual
+
+    def capture_transfer_display(
+        self,
+        rack_id: str,
+        *,
+        infer: bool,
+    ) -> tuple[CameraFrame, RackVisualDetection | None]:
+        """Capture a recording frame; inference is explicitly motion-gated."""
+        with self._perception_lock:
+            frame = self.camera.capture()
+            visual = self.vision.detect_visual(frame.color, rack_id) if infer else None
+            # Do not overwrite last_frame: it must stay paired with the last
+            # stable RackObservation used for coordinates/debug artifacts.
+            return frame, visual
 
     def _capture_samples(self) -> tuple[CapturedRackFrame, ...]:
         samples: list[CapturedRackFrame] = []
@@ -212,7 +245,7 @@ class TubeGrabberRuntime:
         if not self.motion_parameters_confirmed:
             raise ConfigError(
                 "motion.parameters_confirmed is false; verify TCP offset, "
-                "workspace and vertical heights at low speed first"
+                "workspace and rack-normal motion heights at low speed first"
             )
         run_mode = self.arm.get_run_mode()
         if run_mode != 1:
@@ -242,11 +275,11 @@ def build_runtime(
     geometry_config = config["geometry"]
     motion_config = config["motion"]
     cap_config = vision_config["cap"]
-    pose_config = vision_config["rack_pose"]
+    screw_config = vision_config["screw"]
     stability_config = vision_config["stability"]
     plane_data = vision_config["plane"]
     matching_config = vision_config["matching"]
-    pose_quality = _rack_pose_quality_config(pose_config)
+    pose_quality = _rack_pose_quality_config(screw_config)
     rack_stability = _rack_stability_config(stability_config)
     rack_plane = _rack_plane_config(plane_data)
     rack_matching = _rack_matching_config(
@@ -259,10 +292,6 @@ def build_runtime(
     poses = load_yaml(motion_config["poses_path"])
     observation_data = _mapping(poses.get("observation_pose"), "observation_pose")
     observation_pose = _pose_from_config(observation_data, "observation_pose")
-    vertical_rpy = _vector3(
-        poses.get("vertical_tool_rpy_rad"),
-        "vertical_tool_rpy_rad",
-    )
 
     mode = str(runtime_config["mode"])
     if mode == "real":
@@ -289,6 +318,10 @@ def build_runtime(
         )
         gripper = RealManGripper(
             arm=arm,
+            baudrate=int(gripper_config["baudrate"]),
+            tool_voltage=int(gripper_config["tool_voltage"]),
+            speed=int(gripper_config["speed"]),
+            force=int(gripper_config["force"]),
             open_position=int(gripper_config["open_position"]),
             grip_position=int(gripper_config["grip_position"]),
             reset_position=int(gripper_config["reset_position"]),
@@ -297,6 +330,10 @@ def build_runtime(
             poll_interval_s=float(gripper_config["poll_interval_s"]),
             state_read_attempts=int(gripper_config["state_read_attempts"]),
             state_read_retry_s=float(gripper_config["state_read_retry_s"]),
+            power_on_wait_s=float(gripper_config["power_on_wait_s"]),
+            protocol_startup_wait_s=float(
+                gripper_config["protocol_startup_wait_s"]
+            ),
         )
         cap_detector = YoloCapDetector(
             model_path=project_path(cap_config["model_path"]),
@@ -306,15 +343,14 @@ def build_runtime(
             image_size=int(cap_config["image_size"]),
             device=str(vision_config["device"]),
         )
-        pose_detector = YoloRackPoseDetector(
-            model_path=project_path(pose_config["model_path"]),
-            class_names=pose_config["class_names"],
-            keypoint_names=pose_config["keypoint_names"],
-            confidence=float(pose_config["confidence"]),
-            keypoint_confidence=float(pose_config["keypoint_confidence"]),
-            iou=float(pose_config["iou"]),
-            image_size=int(pose_config["image_size"]),
+        screw_detector = YoloScrewRackDetector(
+            model_path=project_path(screw_config["model_path"]),
+            class_names=screw_config["class_names"],
+            confidence=float(screw_config["confidence"]),
+            iou=float(screw_config["iou"]),
+            image_size=int(screw_config["image_size"]),
             device=str(vision_config["device"]),
+            marker=_screw_marker_config(screw_config["marker"]),
         )
         hand_eye = load_yaml(geometry_config["hand_eye_path"])
         if hand_eye.get("translation_unit") != "mm":
@@ -334,7 +370,7 @@ def build_runtime(
                 else None
             )
         vision = PoseRackVision(
-            rack_pose_detector=pose_detector,
+            rack_pose_detector=screw_detector,
             cap_detector=cap_detector,
             calibrations=calibrations,
             hand_eye_end_from_camera=hand_eye["matrix"],
@@ -349,9 +385,16 @@ def build_runtime(
         camera = None
         gripper = FakeGripper()
         cap_height = float(geometry_config["cap_top_above_rack_mm"])
+        fake_approach_axis = tuple(
+            float(value) for value in plane_data["expected_normal_base"]
+        )
         observer = FakeRackObserver(
             *(
-                _fake_observation(rack_id, cap_height)
+                _fake_observation(
+                    rack_id,
+                    cap_height,
+                    approach_axis_base=fake_approach_axis,
+                )
                 for rack_id in config["racks"]
             )
         )
@@ -360,19 +403,19 @@ def build_runtime(
 
     planner = MotionPlanner(
         tcp_offset_end_mm=geometry_config["tcp_offset_end_mm"],
-        vertical_tool_rpy_rad=vertical_rpy,
+        destination_tcp_offset_end_mm=geometry_config.get(
+            "destination_tcp_offset_end_mm",
+            geometry_config["tcp_offset_end_mm"],
+        ),
         approach_height_mm=float(motion_config["approach_height_mm"]),
         retreat_height_mm=float(motion_config["retreat_height_mm"]),
         transit_speed_percent=int(arm_config["transit_speed_percent"]),
         approach_speed_percent=int(arm_config["approach_speed_percent"]),
-        maximum_orientation_error_deg=float(
-            motion_config["maximum_orientation_error_deg"]
-        ),
         maximum_single_orientation_change_deg=float(
             motion_config["maximum_single_orientation_change_deg"]
         ),
-        maximum_tool_tilt_deg=float(
-            motion_config["maximum_tool_tilt_deg"]
+        maximum_tool_axis_misalignment_deg=float(
+            motion_config["maximum_tool_axis_misalignment_deg"]
         ),
         tube_total_length_mm=float(
             geometry_config["tube_total_length_mm"]
@@ -386,6 +429,9 @@ def build_runtime(
         workspace_min_mm=motion_config["workspace_min_mm"],
         workspace_max_mm=motion_config["workspace_max_mm"],
         maximum_single_move_mm=float(motion_config["maximum_single_move_mm"]),
+        reached_check_settle_s=float(
+            motion_config.get("reached_check_settle_s", 1.0)
+        ),
         position_reached_tolerance_mm=float(
             motion_config["position_reached_tolerance_mm"]
         ),
@@ -416,6 +462,16 @@ def build_runtime(
         scene_recheck_plane_tolerance_mm=float(
             runtime_config["scene_recheck_plane_tolerance_mm"]
         ),
+        # FakeRackObserver uses this callback to advance its in-memory rack
+        # state after a simulated pick. Real hardware follows the configured
+        # visibility policy exactly.
+        destination_recheck_while_carrying=(
+            True
+            if mode == "fake"
+            else bool(
+                runtime_config.get("destination_recheck_while_carrying", True)
+            )
+        ),
     )
     return TubeGrabberRuntime(
         mode=mode,
@@ -442,20 +498,24 @@ def _fake_observation(
     rack_id: str,
     cap_top_above_rack_mm: float,
     *,
+    approach_axis_base: tuple[float, float, float] = (0.0, 0.0, 1.0),
     occupied: set[tuple[int, int]] | None = None,
 ) -> RackObservation:
     """Deterministic 2x6 rack used by fake mode and the full-chain test."""
     if occupied is None:
         occupied = {(1, 1)}
-    plane_z_mm = -470.0
+    # Keep the synthetic rack coplanar with the configured 45-degree normal
+    # and place every generated flange waypoint inside the configured workspace.
+    plane_z_mm = -195.0
     slots: list[SlotObservation] = []
     for row in (1, 2):
         for column in range(1, 7):
             address = SlotAddress(rack_id, row, column)
-            x_mm = 20.0 + 22.0 * (column - 1)
-            y_mm = 290.0 + 32.0 * (row - 1)
+            x_mm = 300.0 + 22.0 * (column - 1)
+            y_mm = 300.0 + 32.0 * (row - 1)
+            z_mm = x_mm - 550.0
             is_occupied = (row, column) in occupied
-            hole = Point3D(x_mm, y_mm, plane_z_mm)
+            hole = Point3D(x_mm, y_mm, z_mm)
             slots.append(
                 SlotObservation(
                     address=address,
@@ -466,9 +526,12 @@ def _fake_observation(
                     pixel=Pixel(x_mm, y_mm),
                     cap_top_base=(
                         Point3D(
-                            x_mm,
-                            y_mm,
-                            plane_z_mm + cap_top_above_rack_mm,
+                            x_mm
+                            + approach_axis_base[0] * cap_top_above_rack_mm,
+                            y_mm
+                            + approach_axis_base[1] * cap_top_above_rack_mm,
+                            z_mm
+                            + approach_axis_base[2] * cap_top_above_rack_mm,
                         )
                         if is_occupied
                         else None
@@ -482,20 +545,27 @@ def _fake_observation(
         plane_z_mm=plane_z_mm,
         slots=tuple(slots),
         timestamp_ms=0.0,
+        approach_axis_base=approach_axis_base,
     )
 
 
 def _rack_pose_quality_config(data: dict[str, Any]) -> RackPoseQualityConfig:
-    red = _mapping(data.get("k0_red_marker"), "vision.rack_pose.k0_red_marker")
     return RackPoseQualityConfig(
         minimum_rack_area_px2=float(data["minimum_rack_area_px2"]),
         maximum_opposite_side_ratio=float(data["maximum_opposite_side_ratio"]),
-        screw_edge_margin=float(data["screw_edge_margin"]),
-        k0_red_patch_radius_px=int(red["patch_radius_px"]),
-        k0_red_minimum_ratio=float(red["minimum_red_ratio"]),
-        k0_red_minimum_ratio_margin=float(red["minimum_ratio_margin"]),
-        k0_red_minimum_saturation=int(red["minimum_saturation"]),
-        k0_red_minimum_value=int(red["minimum_value"]),
+    )
+
+
+def _screw_marker_config(data: dict[str, Any]) -> ScrewMarkerConfig:
+    return ScrewMarkerConfig(
+        minimum_value=int(data["minimum_value"]),
+        maximum_saturation=int(data["maximum_saturation"]),
+        search_radius_factor=float(data["search_radius_factor"]),
+        screw_exclusion_scale=float(data["screw_exclusion_scale"]),
+        minimum_area_px2=int(data["minimum_area_px2"]),
+        maximum_area_ratio=float(data["maximum_area_ratio"]),
+        minimum_score_ratio=float(data["minimum_score_ratio"]),
+        minimum_rack_aspect_ratio=float(data["minimum_rack_aspect_ratio"]),
     )
 
 
@@ -528,6 +598,9 @@ def _rack_plane_config(data: dict[str, Any]) -> RackPlaneFitConfig:
         minimum_inlier_ratio=float(data["minimum_inlier_ratio"]),
         maximum_rms_error_mm=float(data["maximum_rms_error_mm"]),
         maximum_tilt_deg=float(data["maximum_tilt_deg"]),
+        expected_normal_base=tuple(
+            float(value) for value in data["expected_normal_base"]
+        ),
     )
 
 
@@ -545,9 +618,6 @@ def _rack_matching_config(
         maximum_cap_height_error_mm=float(cap["maximum_height_error_mm"]),
         cap_slot_max_distance_factor=float(
             matching["cap_slot_max_distance_factor"]
-        ),
-        maximum_calibration_keypoint_shift_ratio=float(
-            matching["maximum_calibration_keypoint_shift_ratio"]
         ),
     )
 

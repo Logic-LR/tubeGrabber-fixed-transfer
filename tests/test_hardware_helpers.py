@@ -31,37 +31,51 @@ class _FakeArm:
         def __init__(self) -> None:
             self.calls: list[tuple] = []
             self.position = 170
-            self.mode = 3
+            self.mode = 2
+            self.speed = 0
             self.current_force = 10
 
-        def rm_set_gripper_position(
-            self,
-            position: int,
-            block: bool,
-            timeout: int,
+        def rm_set_tool_voltage(self, voltage: int) -> int:
+            self.calls.append(("tool_voltage", voltage))
+            return 0
+
+        def rm_set_rm_plus_mode(self, baudrate: int) -> int:
+            self.calls.append(("plus_mode", baudrate))
+            return 0
+
+        def rm_set_hand_force(self, force: int) -> int:
+            self.calls.append(("hand_force", force))
+            return 0
+
+        def rm_set_hand_speed(self, speed: int) -> int:
+            self.calls.append(("hand_speed", speed))
+            return 0
+
+        def rm_set_hand_follow_pos(
+            self, positions: list[int], block: bool
         ) -> int:
-            self.calls.append(("gripper_position", position, block, timeout))
+            position = positions[0]
+            self.calls.append(("follow_position", positions, block))
             if position == 135:
                 # A real tube can stop the jaws before the requested position.
                 self.position = 150
-                self.mode = 6
+                self.mode = 3
                 self.current_force = 200
             else:
                 self.position = position
-                self.mode = 3
+                self.mode = 2
                 self.current_force = 10
             return 0
 
-        def rm_get_gripper_state(self) -> tuple[int, dict]:
+        def rm_get_rm_plus_state_info(self) -> tuple[int, dict]:
             self.calls.append(("state",))
             return 0, {
-                "enable_state": 1,
-                "status": 1,
-                "error": 0,
-                "mode": self.mode,
-                "current_force": self.current_force,
-                "temperature": 30,
-                "actpos": self.position,
+                "sys_state": 0,
+                "dof_err": [0, 0, 0, 0, 0, 0],
+                "dof_state": [self.mode, 0, 0, 0, 0, 0],
+                "pos": [self.position, 0, 0, 0, 0, 0],
+                "speed": [self.speed, 0, 0, 0, 0, 0],
+                "force": [self.current_force, 0, 0, 0, 0, 0],
             }
 
     def __init__(self) -> None:
@@ -231,10 +245,14 @@ class HardwareHelpersTest(unittest.TestCase):
         )
 
         intrinsics.model = "distortion.inverse_brown_conrady"
-        with self.assertRaisesRegex(HardwareError, "暂不支持"):
-            _read_color_intrinsics(frame)
+        result = _read_color_intrinsics(frame)
+        self.assertEqual(result.distortion_model, "inverse_brown_conrady")
+        self.assertEqual(
+            result.distortion_coefficients,
+            (0.1, 0.0, 0.0, 0.0, 0.0),
+        )
 
-    def test_gripper_uses_two_finger_position_and_feedback(self) -> None:
+    def test_gripper_uses_rm_plus_position_and_feedback(self) -> None:
         arm = _FakeArm()
         gripper = RealManGripper(arm)  # type: ignore[arg-type]
         with patch("tube_grabber.hardware.realman_gripper.time.sleep"):
@@ -244,12 +262,17 @@ class HardwareHelpersTest(unittest.TestCase):
             gripper.release()
             gripper.reset()
         calls = arm.sdk_robot.calls
-        self.assertEqual(calls[0], ("state",))
-        commanded = [call for call in calls if call[0] == "gripper_position"]
-        self.assertEqual([call[1] for call in commanded], [170, 135, 170, 1])
-        self.assertTrue(all(call[2:] == (True, 5) for call in commanded))
-        self.assertNotIn("follow_position", [call[0] for call in calls])
-        self.assertGreaterEqual(sum(call[0] == "state" for call in calls), 13)
+        self.assertEqual(calls[0], ("tool_voltage", 3))
+        self.assertEqual(calls[1], ("plus_mode", 9600))
+        commanded = [call for call in calls if call[0] == "follow_position"]
+        self.assertEqual(
+            [call[1][0] for call in commanded],
+            [170, 135, 170, 1],
+        )
+        self.assertTrue(all(call[2] is False for call in commanded))
+        self.assertEqual(sum(call[0] == "hand_force" for call in calls), 4)
+        self.assertEqual(sum(call[0] == "hand_speed" for call in calls), 4)
+        self.assertGreaterEqual(sum(call[0] == "state" for call in calls), 17)
 
 
 if __name__ == "__main__":

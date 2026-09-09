@@ -9,7 +9,7 @@ import yaml
 
 from tube_grabber.core.errors import ConfigError
 from tube_grabber.vision.rack_calibration import RackCircleFitConfig
-from tube_grabber.vision.rack_pose import RACK_KEYPOINT_NAMES
+from tube_grabber.vision.rack_pose import ScrewMarkerConfig
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -63,7 +63,7 @@ def load_config(path: str | Path = "config/app.yaml") -> dict[str, Any]:
     vision = data["vision"]
     for subsection in (
         "cap",
-        "rack_pose",
+        "screw",
         "calibration",
         "stability",
         "plane",
@@ -83,22 +83,27 @@ def load_config(path: str | Path = "config/app.yaml") -> dict[str, Any]:
             "vision.device must be a local CUDA device index such as '0'"
         )
     cap_names = vision["cap"].get("class_names")
-    if cap_names not in ({0: "tube_cap"}, {"0": "tube_cap"}):
-        raise ConfigError("vision.cap.class_names must be {0: tube_cap}")
-    pose_names = vision["rack_pose"].get("class_names")
-    if pose_names not in ({0: "rack_surface"}, {"0": "rack_surface"}):
-        raise ConfigError(
-            "vision.rack_pose.class_names must be {0: rack_surface}"
+    if cap_names not in ({0: "item"}, {"0": "item"}):
+        raise ConfigError("vision.cap.class_names must be {0: item}")
+    screw_names = vision["screw"].get("class_names")
+    if screw_names not in ({0: "item"}, {"0": "item"}):
+        raise ConfigError("vision.screw.class_names must be {0: item}")
+    marker = vision["screw"].get("marker")
+    if not isinstance(marker, dict):
+        raise ConfigError("vision.screw.marker must be a mapping")
+    try:
+        ScrewMarkerConfig(
+            minimum_value=int(marker["minimum_value"]),
+            maximum_saturation=int(marker["maximum_saturation"]),
+            search_radius_factor=float(marker["search_radius_factor"]),
+            screw_exclusion_scale=float(marker["screw_exclusion_scale"]),
+            minimum_area_px2=int(marker["minimum_area_px2"]),
+            maximum_area_ratio=float(marker["maximum_area_ratio"]),
+            minimum_score_ratio=float(marker["minimum_score_ratio"]),
+            minimum_rack_aspect_ratio=float(marker["minimum_rack_aspect_ratio"]),
         )
-    keypoint_names = tuple(
-        str(value) for value in vision["rack_pose"].get("keypoint_names", ())
-    )
-    if keypoint_names != RACK_KEYPOINT_NAMES:
-        raise ConfigError(
-            "vision.rack_pose.keypoint_names must be k0..k3 then screw_k0..screw_k3"
-        )
-    if not isinstance(vision["rack_pose"].get("k0_red_marker"), dict):
-        raise ConfigError("vision.rack_pose.k0_red_marker must be a mapping")
+    except (KeyError, TypeError, ValueError) as error:
+        raise ConfigError(f"vision.screw.marker is invalid: {error}") from error
     circle = vision["calibration"]
     try:
         RackCircleFitConfig(
@@ -132,12 +137,13 @@ def load_config(path: str | Path = "config/app.yaml") -> dict[str, Any]:
         raise ConfigError(
             "arm.tool_frame must be Arm_Tip because TCP offset is applied in code"
         )
-    maximum_tool_tilt_deg = float(
-        data["motion"].get("maximum_tool_tilt_deg", 0.0)
+    maximum_tool_axis_misalignment_deg = float(
+        data["motion"].get("maximum_tool_axis_misalignment_deg", 0.0)
     )
-    if not 0.0 < maximum_tool_tilt_deg <= 5.0:
+    if not 0.0 < maximum_tool_axis_misalignment_deg <= 30.0:
         raise ConfigError(
-            "motion.maximum_tool_tilt_deg must be greater than 0 and at most 5"
+            "motion.maximum_tool_axis_misalignment_deg must be greater than 0 "
+            "and at most 30"
         )
 
     if set(data["racks"]) != {"rack_1", "rack_2"}:

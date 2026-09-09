@@ -1,157 +1,487 @@
 # Tube Grabber
 
-面向 2×6 试管架的视觉引导抓放主线。最终视觉方案只有一条：
+基于 Intel RealSense D435、Ultralytics YOLO 和 RealMan 七轴机械臂的 2×6 试管架视觉引导抓放系统。
 
-- `cap.pt`：YOLO detection 识别试管盖，结合 D435 对齐深度得到盖顶三维坐标；
-- `rack_pose.pt`：YOLO Pose 识别架面 8 点，顺序固定为
-  `k0, k1, k2, k3, screw_k0, screw_k1, screw_k2, screw_k3`；
-- `screw_k0` 旁的小红圆点独立确认架面方向；
-- 连续多帧推理经过几何检查、异常帧剔除和中值聚合；
-- RGB-D 架面 ROI 使用 RANSAC 拟合真实平面；
-- 正上方标定时自动拟合 `r1c1`、`r2c6` 槽圆，人工微调圆心和半径后生成 12 个槽位；
-- 槽位不再使用 YOLO detection，空槽由“没有盖子匹配到该标定槽位”确定。
+项目提供从 RGB-D 感知、试管架标定、槽位状态判断、三维定位、运动规划到抓放后复扫验证的完整同架闭环，同时支持不连接任何硬件的 Fake 模式和可选的自然语言命令解析。
+
+> [!CAUTION]
+> 这是会驱动真实机械臂的实验项目，不是安全认证系统。真机运行必须保证急停可触达、底盘锁定、机械臂周围无人且无障碍，并由操作人员低速监护。不要直接复用仓库中的手眼、TCP、观察位或工作空间参数到另一台设备。
 
 ## 当前状态
 
-代码、fake 闭环和离线测试已经完成。架面 Pose 模型尚未训练，仓库也不提交
-`.pt` 权重；真实精度、GPU 帧率、双圆心标定、手眼矩阵、TCP 和运动参数仍需在
-部署机与真机上验收。没有模型或标定时 real 模式会明确拒绝运行，不会回退到旧的
-孔位 detection 或 CPU 推理。
+| 项目 | 状态 |
+|---|---|
+| Fake 扫描、规划、抓放闭环 | 已实现 |
+| D435 对齐 RGB-D 采集 | 已实现 |
+| cap / screw 双 YOLO Detection | 已实现，真机固定使用 CUDA:0 |
+| 2×6 槽位标定与占用判断 | 已实现 |
+| RealMan 七轴机械臂与 RM Plus 两指夹爪 | 已接入 |
+| 同一试管架内抓放与最终复扫 | 已实现 |
+| 本地 / Gemini 文本命令解析 | 已实现 |
+| rack_1 现场标定 | 已包含 |
+| rack_2 现场标定 | 尚未包含，real 模式预检会拒绝通过 |
+| 跨试管架底盘导航 | 未实现，命令会被安全拒绝 |
+| 语音输入与播报 | 未实现 |
 
-## 架构
+项目版本：<code>0.1.0</code>。默认配置为 <code>runtime.mode: fake</code>，克隆后不会连接真实硬件。
 
-```text
-D435 连续 RGB-D 帧 + 右臂观察位姿
+## 核心能力
+
+- 使用 <code>screw.pt</code> 检测四颗角螺丝，以检测框中心定义架面；
+- 使用额外白色 marker 确定物理 K0，避免试管架方向翻转；
+- 使用 <code>cap.pt</code> 检测试管盖，并结合对齐深度计算盖顶三维坐标；
+- 对连续多帧执行几何校验、异常帧剔除、中值融合与稳定性门禁；
+- 在架面 ROI 内使用 RANSAC 拟合真实平面，支持轻微倾斜的试管架；
+- 通过 <code>r1c1</code> 与 <code>r2c6</code> 双圆心标定生成完整 2×6 槽位；
+- 通过盖子与标定槽位的一对一匹配判断 <code>OCCUPIED</code> / <code>EMPTY</code>；
+- 统一使用 mm、rad 和 <code>base_right</code> 坐标系，只在 SDK 边界进行单位转换；
+- 规划前检查占用、工作空间、单段距离、工具方向、管体净空和控制器状态；
+- 执行前重新扫描并用最新坐标重建抓取计划；
+- 放置后自动返回观察位，最终复扫确认源槽为空、目标槽占用。
+
+## 工作原理
+
+~~~text
+D435 连续 RGB-D 帧 + 右臂法兰位姿
         │
-        ├─ rack_pose.pt ─→ 8 点 + K0 红点方向检查
-        │                  └→ 多帧异常值剔除/中值融合
+        ├─ screw.pt ─→ 四颗螺丝中心 ─→ 白色 marker 定向 K0～K3
+        │                                  │
+        │                                  └─ 多帧过滤与架面几何检查
         │
-        ├─ 架面四角 ROI 深度 ─→ RANSAC 平面
+        ├─ 架面深度 ROI ─→ RANSAC 平面 ─→ 12 个槽位三维坐标
         │
-        └─ cap.pt ─→ 盖中心深度 ─→ 盖顶 base_right XYZ
-                           │
-双圆心标定 r1c1/r2c6 ─→ 12 槽投影 ─→ 盖子/槽位匹配
-                           │
-                    RackObservation
-                           │
-     自动观察位 → 最新抓取 → 高位目标复检/重规划
-                           │
-              放置 → 自动回观察位 → 最终复扫
-```
+        └─ cap.pt ─→ 盖中心 + 对齐深度 ─→ 盖顶三维坐标
+                                                   │
+r1c1 / r2c6 双圆心标定 ─→ 2×6 网格 ─→ 槽位占用匹配
+                                                   │
+                                            RackObservation
+                                                   │
+                              规划 → 抓取 → 放置 → 最终复扫
+~~~
 
-边界保持单向：`vision` 只输出观测，`workflow` 只处理任务状态，`motion` 只处理
-坐标和轨迹，`hardware` 是唯一调用 RealSense/RealMan SDK 的层。项目内部位置统一
-为 mm、角度为 rad、工作坐标系为 `base_right`；只有机械臂驱动边界进行 mm↔m。
+代码保持单向分层：
 
-详细设计见 [架构说明](docs/ARCHITECTURE.md)，模型与标注见
-[模型契约](docs/MODEL_CONTRACT.md)。从安装、训练、标定到真机分阶段执行的完整操作流程见
-[详细使用说明](docs/USAGE.md)。底盘站点、跨架状态机、失败恢复、麦克风选择和离线语音方案见
-[底盘导航与语音控制完整实施方案](docs/NAVIGATION_AND_VOICE.md)。
+| 模块 | 职责 |
+|---|---|
+| <code>core</code> | 坐标、槽位、观测对象、错误类型和硬件接口 |
+| <code>vision</code> | YOLO、marker、深度、架面、标定与多帧融合 |
+| <code>workflow</code> | 任务状态、占用校验、复扫与抓放顺序 |
+| <code>motion</code> | TCP/法兰变换、航点规划和运动门禁 |
+| <code>hardware</code> | RealSense、RealMan 和夹爪 SDK 适配 |
+| <code>agent</code> | 本地或 Gemini 文本命令解析 |
+| <code>app / cli</code> | 依赖组装、生命周期、人工确认和命令入口 |
 
-## 安装与 GPU
+更详细的设计见 [架构说明](docs/ARCHITECTURE.md)。
 
-Python 要求 ≥3.10。真实部署应先按本机 CUDA/驱动版本安装 CUDA 版 PyTorch，再安装：
+## 硬件与软件要求
 
-```bash
+### 硬件
+
+- Intel RealSense D435 腕部相机；
+- RealMan 七自由度机械臂；
+- RM Plus ZX 1DOF 两指夹爪；
+- NVIDIA CUDA GPU；
+- 带四颗可见角螺丝和 K0 白色 marker 的 2×6 试管架。
+
+### 软件
+
+- Python 3.10 或更高版本；
+- 与本机驱动/CUDA 匹配的 CUDA 版 PyTorch；
+- Ultralytics 8.3.x；
+- Intel RealSense Python SDK；
+- RealMan 厂商 Python SDK，导入名为 <code>Robotic_Arm</code>；
+- 有图形界面的桌面会话，用于实时预览和交互标定。
+
+## 安装
+
+### 1. 获取项目并创建环境
+
+~~~bash
+git clone <your-repository-url>
+cd tubeGrabber
+
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+~~~
+
+Windows 激活虚拟环境时使用：
+
+~~~powershell
+.venv\Scripts\Activate.ps1
+~~~
+
+### 2. Fake 模式最小安装
+
+~~~bash
+python -m pip install -e .
+~~~
+
+### 3. 真机视觉依赖
+
+先按照部署机的 NVIDIA 驱动与 CUDA 版本安装对应的 CUDA 版 PyTorch，再安装：
+
+~~~bash
 python -m pip install -e ".[vision,realsense]"
-```
+~~~
 
-RealMan SDK 需要由厂商安装并可导入：
+检查 CUDA：
 
-```bash
+~~~bash
+python -c "import torch; print(torch.cuda.is_available(), torch.version.cuda)"
+~~~
+
+RealMan SDK 由厂商环境提供，不在本项目依赖中：
+
+~~~bash
 python -c "from Robotic_Arm import rm_robot_interface; print('RealMan SDK OK')"
-```
+~~~
 
-`config/app.yaml` 的最终推理设备固定为 `"0"`（CUDA:0）。`doctor` 会检查 CUDA
-版 PyTorch、GPU、两个模型、两份槽位标定、手眼、观察位和运动参数；real 模式下
-任一缺失都会失败，不静默使用 CPU。
+如需 Gemini 自然语言解析：
 
-## 模型制作
+~~~bash
+python -m pip install -e ".[agent]"
+~~~
 
-1. 在 `screw_k0` 旁贴好永久小红圆点。
-2. 采集架面图片：
+也可以使用 <code>python -m pip install -r requirements.txt</code> 一次安装项目声明的全部第三方依赖；PyTorch 和 RealMan SDK 仍需根据部署机单独安装。
 
-```bash
-python tools/capture_rack_pose_dataset.py --count 500
-```
+## 五分钟 Fake 快速体验
 
-3. 按 [8 点标注契约](training/RACK_POSE_CONTRACT.md) 标注，并按采集序列划分
-   train/val/test。
-4. 复制 `training/rack_pose.yaml.example` 为 `training/rack_pose.yaml`，填写数据路径。
-5. 用本机 GPU 训练并验收：
+Fake 模式不会初始化 D435、机械臂或夹爪，适合验证命令、规划和状态机。
 
-```bash
-python tools/train_rack_pose.py --data training/rack_pose.yaml
-python tools/validate_rack_pose.py --data training/rack_pose.yaml --weights models/rack_pose.pt
-```
+~~~bash
+# 环境与配置检查
+python -m tube_grabber doctor
 
-最终放置：
+# 模拟扫描
+python -m tube_grabber scan --rack rack_1
 
-```text
-models/cap.pt
-models/rack_pose.pt
-```
+# 只生成抓放计划
+python -m tube_grabber plan-transfer \
+  --source rack_1.r1c1 \
+  --destination rack_1.r1c2
 
-## 正上方双圆心标定
+# 执行完整假硬件闭环
+python -m tube_grabber transfer \
+  --source rack_1.r1c1 \
+  --destination rack_1.r1c2
+~~~
 
-先清空 `r1c1`、`r2c6`，低速手动将腕部相机调整到架面正上方并保持机械臂静止。
-标定视角可以不同于正常运行观察位。真实配置和模型就绪后分别运行：
+槽位地址格式为 <code>rack_1.r1c1</code>：架号为 <code>rack_1</code> 或 <code>rack_2</code>，行为 1～2，列为 1～6。源槽必须有管、目标槽必须为空，且当前仅允许同一 rack 内搬运。
 
-```bash
-python -m tube_grabber calibrate-rack --rack rack_1
-python -m tube_grabber calibrate-rack --rack rack_2
-```
+## 模型准备
 
-程序先采集 7 帧并筛出至少 5 个稳定帧，然后显示融合后的 K0～K3、四个螺丝孔和
-红点方向结果。标定操作如下：
+真实视觉需要两个 Ultralytics YOLO Detection 权重：
 
-1. 在 `r1c1` 槽圆附近点击，程序用 Hough 圆拟合给出初始圆；未检测到时使用默认圆。
-2. 按住鼠标左键拖动圆心；用 `[`/`]` 或 `-`/`+` 调半径；方向键或 `I/J/K/L`
-   每次微调圆心 1 px。
-3. 圆周贴合槽边后按 Enter 或空格确认，随后以相同方式确认 `r2c6`。
-4. 检查绿色 2×6 网格中心均落在槽中心后按 `s` 保存。Backspace 撤回，`r` 全部
-   重置，`q` 取消。
+~~~text
+models/
+├── cap.pt      # 试管盖
+└── screw.pt    # 四颗架面角螺丝
+~~~
 
-最终使用的是两个调整后圆的圆心；半径仅用于帮助准确贴合槽边。标定写入
-`config/racks/rack_1.yaml` 或 `rack_2.yaml`，覆盖必须显式使用 `--force`。
+两个模型的元数据类别必须都是：
 
-两个圆心和 8 个关键点都会转换到架面归一化坐标，因此正上方标定后可以回到正常
-观察位运行。参考检查比较的是跨视角不变的归一化布局，而不是标定图片的绝对像素。
-模型关键点语义、机架结构或相机内参改变后应重新标定；相机安装变化还必须重做手眼。
-旧的绝对像素标定格式不会被接受，应使用 `--force` 重新生成当前标定。
+~~~yaml
+names:
+  0: item
+~~~
 
-## 运行命令
+运行时适配层会分别将 <code>item</code> 转换为 <code>tube_cap</code> 和 <code>screw</code>。验证模型：
 
-```bash
+~~~bash
+python -c "from ultralytics import YOLO; print(YOLO('models/cap.pt', task='detect').names)"
+python -c "from ultralytics import YOLO; print(YOLO('models/screw.pt', task='detect').names)"
+python tools/test_yolo_stream.py
+~~~
+
+<code>test_yolo_stream.py</code> 只打开 D435 彩色流并运行两个模型，不连接机械臂或夹爪。按 <code>q</code> 或 <code>Esc</code> 退出。
+
+权重默认被 <code>.gitignore</code> 排除，不会随普通 <code>git push</code> 上传。需要分发权重时，请确认数据和模型许可证允许公开，再选择 Git LFS 或 GitHub Release；否则在 README/Release 中提供合法下载方式和校验值。完整契约见 [模型契约](docs/MODEL_CONTRACT.md) 和 [模型目录说明](models/README.md)。
+
+## 真机部署
+
+### 1. 先复核配置
+
+主要配置位于：
+
+- <code>config/app.yaml</code>：运行模式、硬件、模型、视觉、几何和运动门限；
+- <code>config/hand_eye.yaml</code>：<code>camera_rightwrist → end_right</code> 手眼矩阵；
+- <code>config/poses.yaml</code>：固定观察位；
+- <code>config/racks/rack_1.yaml</code>：rack_1 槽位与展示角点标定。
+
+新设备部署时，先保持 <code>runtime.mode: fake</code>，并将以下两个确认锁设为 <code>false</code>：
+
+~~~yaml
+# config/poses.yaml
+observation_pose:
+  confirmed: false
+
+# config/app.yaml
+motion:
+  parameters_confirmed: false
+~~~
+
+仓库中已有的相机序列号、机械臂 IP、手眼矩阵、TCP、观察位、工作空间和确认状态属于当前实验设备。只有重新测量并低速验证后，才可在目标设备上确认。
+
+### 2. 切换 real 并做只读预检
+
+完成配置复核后，将 <code>runtime.mode</code> 显式改为 <code>real</code>。先运行：
+
+~~~bash
 python -m tube_grabber doctor
 python -m tube_grabber arm-status
 python -m tube_grabber camera-check
 python -m tube_grabber gripper-status
+~~~
+
+- <code>doctor</code> 检查配置、模型契约、CUDA、SDK、手眼、两份 rack 标定和运动确认锁；
+- <code>arm-status</code> 只读取右臂法兰位姿、真实/仿真模式、电源和健康状态；
+- <code>camera-check</code> 采集彩色图和 16 位毫米深度图到 <code>artifacts/</code>；
+- <code>gripper-status</code> 只读取 RM Plus 状态，不发送夹爪位置命令。
+
+当前仓库缺少 <code>config/racks/rack_2.yaml</code>，因此 real 模式 <code>doctor</code> 会保持失败，直到 rack_2 也完成标定。这是安全门禁，不应通过修改代码绕过。
+
+### 3. 标定试管架
+
+每个 rack 都需要单独标定：
+
+1. 清空 <code>r1c1</code> 和 <code>r2c6</code>；
+2. 低速把腕部相机移到架面正上方并保持机械臂、试管架静止；
+3. 运行标定命令；
+4. 点击槽圆附近获得 Hough 初值，拖动圆心并用按键调整；
+5. 检查完整 2×6 网格后保存。
+
+~~~bash
+python -m tube_grabber calibrate-rack --rack rack_1
+python -m tube_grabber calibrate-rack --rack rack_2
+~~~
+
+已有标定必须显式覆盖：
+
+~~~bash
+python -m tube_grabber calibrate-rack --rack rack_1 --force
+~~~
+
+标定窗口操作：
+
+- 鼠标左键：选择或拖动圆心；
+- <code>[</code> / <code>]</code> 或 <code>-</code> / <code>+</code>：调整半径；
+- 方向键或 <code>I/J/K/L</code>：每次微调 1 px；
+- Enter / Space：确认当前圆；
+- <code>s</code>：保存；
+- Backspace：撤回；
+- <code>r</code>：重置；
+- <code>q</code>：取消。
+
+展示用 K0～K3 四角可以独立微调，不改变槽锚点：
+
+~~~bash
+python -m tube_grabber calibrate-corners --rack rack_1
+~~~
+
+详细步骤、重标定条件和现场验收方法见 [完整使用说明](docs/USAGE.md)。
+
+### 4. 扫描与规划验收
+
+先将右臂低速移动到已确认观察位：
+
+~~~bash
+python tools/move_to_observation_pose.py
+~~~
+
+再进行稳定扫描和零运动规划：
+
+~~~bash
 python -m tube_grabber scan --rack rack_1
-python -m tube_grabber plan-transfer --source rack_1.r1c1 --destination rack_1.r2c6
-python -m tube_grabber transfer --source rack_1.r1c1 --destination rack_1.r2c6
-```
 
-默认 `runtime.mode: fake`。真实运动还要求观察位与运动参数已确认、控制器为真实模式且
-上电、控制器和关节无错误、没有 `atom/zhixing_ctrl.py` 抢占控制。`transfer` 先要求
-确认物理空载并输入 `EMPTY`，然后自动进入旧 AprilTag 流程的全局观察位；预览后输入
-`MOVE`。执行前复扫会重建抓取计划，携管时在目标高位走廊复检并重规划放置，释放后
-自动回观察位，最终确认源空、目标占用才成功。`plan-transfer` 保持零运动承诺，因此
-运行前仍需人工将右臂置于观察位。
+python -m tube_grabber plan-transfer \
+  --source rack_1.r1c1 \
+  --destination rack_1.r1c2
+~~~
 
-夹爪按当前 RealMan 两指夹爪接入：只使用两指夹爪专用的
-`rm_set_gripper_position` 与 `rm_get_gripper_state`；不会调用六自由度灵巧手的
-`rm_set_hand_follow_pos`。阻塞命令返回后还会连续检查在线、使能、错误码、工作模式
-和实际开度。
+<code>scan</code> 默认打开实时窗口；无桌面环境时添加 <code>--no-display</code>。<code>plan-transfer</code> 不初始化夹爪、不发送机械臂运动，但在 real 模式下会连接机械臂和相机，并要求右臂已经位于观察位。
+
+### 5. 执行抓放
+
+~~~bash
+python -m tube_grabber transfer \
+  --source rack_1.r1c1 \
+  --destination rack_1.r1c2
+~~~
+
+当前真机流程：
+
+1. 检查右臂、夹爪、控制器、冲突进程和运动参数；
+2. 操作者确认 TCP 空载、路径无障碍，按 Enter 允许自动进入观察位；
+3. 执行稳定扫描并打印观测和航点预览；
+4. 操作者再次按 Enter 授权抓放；
+5. 执行前复扫，并使用最新坐标重建抓取计划；
+6. 按配置逐步确认张开、下降、夹紧、抬升、平移、放置和撤离；
+7. 自动返回观察位并复扫，只有源空、目标占用且其他槽位无异常才报告成功。
+
+任一人工确认处都可输入 <code>q</code> 取消。当前 <code>destination_recheck_while_carrying: false</code>：腕部相机在持管目标高位无法看到全部四颗螺丝，因此放置复用抓取前完整扫描的目标坐标，释放后再进行完整闭环复扫。
+
+## 命令参考
+
+| 命令 | 作用 | 是否可能运动 |
+|---|---|---|
+| <code>doctor</code> | 静态检查配置、依赖、模型和标定 | 否 |
+| <code>arm-status</code> | 读取机械臂状态与法兰位姿 | 否 |
+| <code>camera-check</code> | 保存一帧彩色图和深度图 | 否 |
+| <code>gripper-status</code> | 读取夹爪状态 | 否 |
+| <code>scan --rack ...</code> | 实时预览并执行稳定扫描 | 否 |
+| <code>calibrate-rack --rack ...</code> | 标定两个对角槽位 | 否，但要求人工预先摆位 |
+| <code>calibrate-corners --rack ...</code> | 微调展示四角 | 否 |
+| <code>plan-transfer</code> | 扫描并打印完整航点 | 否 |
+| <code>transfer</code> | 执行同架抓放闭环 | 是 |
+| <code>agent-plan</code> | 解析文本并走只读规划流程 | 否 |
+| <code>agent-transfer</code> | 解析文本并走完整抓放流程 | 是 |
+
+查看全部参数：
+
+~~~bash
+python -m tube_grabber --help
+python -m tube_grabber <command> --help
+~~~
+
+安装为可编辑包后，也可以将 <code>python -m tube_grabber</code> 替换为 <code>tube-grabber</code>。
+
+## Agent 命令
+
+默认 <code>local</code> 解析器完全离线，要求文本中恰好包含两个标准槽位地址：
+
+~~~bash
+python -m tube_grabber agent-plan \
+  --text "rack_1.r1c1 -> rack_1.r1c2"
+~~~
+
+Gemini 只负责把自然语言转换为结构化 <code>TransferCommand</code>，不会获得硬件控制函数。API key 必须通过环境变量提供：
+
+~~~bash
+export GEMINI_API_KEY="your-key"
+
+python -m tube_grabber agent-plan \
+  --agent-provider gemini \
+  --text "把一号架第一行第一列的试管移动到一号架第一行第二列"
+~~~
+
+不要把密钥写入 YAML、Python、日志或 Git。无论使用哪个 Agent，Python 端都会重新检查槽位范围、源目标关系、占用、视觉、规划、同架限制和人工确认。详见 [Agent 接入说明](docs/AGENT.md)。
+
+## 关键配置
+
+| 配置路径 | 含义 |
+|---|---|
+| <code>runtime.mode</code> | <code>fake</code> 或 <code>real</code> |
+| <code>runtime.require_enter_before_motion</code> | 观察位和抓放前人工确认 |
+| <code>runtime.destination_recheck_while_carrying</code> | 是否在持管目标高位重新扫描 |
+| <code>camera</code> | 序列号、分辨率、帧率、深度范围 |
+| <code>arm</code> | IP、端口、坐标系、速度和冲突进程 |
+| <code>gripper</code> | RM Plus 波特率、电压、开合位置、力和超时 |
+| <code>vision.cap / screw</code> | 权重、类别、置信度、IoU 和输入尺寸 |
+| <code>vision.stability</code> | 多帧数量、内点数量和抖动门限 |
+| <code>vision.plane</code> | RANSAC 和架面法向门限 |
+| <code>geometry</code> | 手眼、TCP、盖高、抓取深度、管长和净空 |
+| <code>motion</code> | 确认锁、速度、航点高度、工作空间和到位误差 |
+
+修改 TCP 时可以使用：
+
+~~~bash
+python tools/tune_tcp.py --show
+python tools/tune_tcp.py --dry-run --delta 0 0 1
+~~~
+
+该工具一旦写入新的 TCP，会自动把 <code>motion.parameters_confirmed</code> 重新锁为 <code>false</code>。<code>tools/retreat_from_rack.py</code> 是仅供现场异常恢复的 150 mm 法向撤离工具，不属于正常任务流程，使用前必须阅读源码并确认当前夹爪空载。
+
+## 项目结构
+
+~~~text
+.
+├── config/                 # 应用、手眼、观察位和 rack 标定
+├── docs/                   # 架构、使用、模型、Agent 和真机清单
+├── models/                 # 本地 YOLO 权重（默认不提交）
+├── artifacts/              # 运行时调试图（默认不提交）
+├── tests/                  # 离线单元与集成测试
+├── tools/                  # 真机检查、观察位、TCP 与恢复工具
+├── tube_grabber/
+│   ├── agent/
+│   ├── core/
+│   ├── fakes/
+│   ├── hardware/
+│   ├── motion/
+│   ├── vision/
+│   └── workflow/
+├── pyproject.toml
+└── requirements.txt
+~~~
 
 ## 测试
 
-```bash
+运行全部离线测试：
+
+~~~bash
 python -m unittest discover -s tests -v
-```
+~~~
 
-离线测试覆盖模型契约、K0 红点、关键点几何、多帧滤波、双点标定、架面 RANSAC、
-完整 Pose+cap+槽位流水线、坐标变换、最新坐标重规划、观察位往返、最终状态验证、
-运动规划、硬件 SDK 翻译和 fake 抓放闭环。
+测试覆盖：
 
-首次真机必须按 [实验室检查清单](docs/LAB_CHECKLIST.md) 从只读检查逐级推进。
+- 槽位地址、占用状态和命令解析；
+- screw 四角排序、marker 定向和几何拒绝；
+- 多帧过滤、架面 RANSAC、深度与坐标变换；
+- 双圆心标定、2×6 网格和盖子/槽位匹配；
+- TCP/法兰转换、倾斜架面运动规划和工作空间门禁；
+- RealSense、RealMan 与 RM Plus SDK 返回值适配；
+- Fake 扫描、规划、Agent 和完整抓放闭环；
+- 执行前现场变化、异常持管状态和最终复扫失败路径。
+
+单元测试不能证明真机识别精度或运动安全。第一次实机运行必须按 [真机分阶段检查清单](docs/LAB_CHECKLIST.md) 从只读检查逐级推进。
+
+## 常见问题
+
+### doctor 报 CUDA 不可用
+
+确认 PyTorch 是 CUDA 构建、NVIDIA 驱动可见，并且 <code>vision.device</code> 指向存在的 GPU。real 模式不会静默回退 CPU。
+
+### 模型契约错误
+
+确认两个权重都是 Detection 模型，且 <code>model.names == {0: 'item'}</code>。旧的 YOLO Pose / <code>rack_pose.pt</code> 不属于当前运行链。
+
+### rack_2 标定缺失
+
+在真实模式下完成 <code>calibrate-rack --rack rack_2</code>。不要复制 rack_1 的标定文件，因为槽位布局、相机视角和安装误差不同。
+
+### 扫描不稳定
+
+检查四颗螺丝是否完整可见、白色 marker 是否唯一、反光与遮挡、相机是否静止、深度是否有效，再根据现场统计调整置信度和稳定性门限。
+
+### 无法打开 OpenCV 窗口
+
+从桌面图形会话运行；只做一次稳定扫描时可添加 <code>scan --no-display</code>。
+
+### 机械臂或夹爪预检失败
+
+确认控制器处于真实模式且已上电、七轴和 Base/Arm_Tip 坐标系正确、RM Plus 使用 9600 波特率和工具端 24 V，并停止 <code>atom</code>、<code>zhixing_ctrl.py</code> 等冲突进程。
+
+### 跨架任务被拒绝
+
+这是预期行为。当前没有底盘导航和带管跨站状态机，只支持同一 rack 内搬运。
+
+## GitHub 发布前检查
+
+- 运行完整离线测试并确认通过；
+- 检查 <code>git status</code>，不要提交 <code>artifacts/</code>、缓存、数据集或训练输出；
+- 确认 <code>GEMINI_API_KEY</code> 等凭据未进入历史、配置或日志；
+- 决定模型权重的合法分发方式；普通 Git 提交不会包含 <code>models/*.pt</code>；
+- 检查设备 IP、相机序列号、标定和运动参数是否适合公开；
+- 如希望他人复制、修改或分发项目，请在发布前添加明确的 <code>LICENSE</code>。
+
+## 文档索引
+
+- [完整使用说明](docs/USAGE.md)
+- [架构说明](docs/ARCHITECTURE.md)
+- [模型契约](docs/MODEL_CONTRACT.md)
+- [Agent 接入说明](docs/AGENT.md)
+- [真机分阶段检查清单](docs/LAB_CHECKLIST.md)
+
+---
+
+如果你只是评估项目，请从 Fake 模式开始；如果你要连接真实设备，请先完成整份真机检查清单。

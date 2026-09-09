@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import unittest
 
-import cv2
 import numpy as np
 
 from tube_grabber.core.errors import VisionError
@@ -22,8 +21,12 @@ from tube_grabber.vision.pose_pipeline import (
     PoseRackVision,
     RackMatchingConfig,
     RackStabilityConfig,
+    _match_caps_to_slots,
 )
-from tube_grabber.vision.rack_calibration import calibrate_slot_grid
+from tube_grabber.vision.rack_calibration import (
+    calibrate_display_corners,
+    calibrate_slot_grid,
+)
 from tube_grabber.vision.rack_pose import RackPoseQualityConfig
 from tests.test_rack_pose import pose
 
@@ -35,15 +38,43 @@ class _PoseDetector:
 
 class _CapDetector:
     def detect(self, _image: object):
-        return [Detection("tube_cap", 0.91, Box(144, 144, 156, 156))]
+        # Detection is deliberately offset 20 px from the calibrated slot.
+        return [Detection("tube_cap", 0.91, Box(164, 144, 176, 156))]
 
 
 class PosePipelineTests(unittest.TestCase):
+    def test_corner_screw_cap_false_positive_is_ignored(self) -> None:
+        projected = tuple(
+            (
+                SlotAddress("rack_1", row + 1, column + 1),
+                Pixel(150 + 60 * column, 150 + 100 * row),
+            )
+            for row in range(2)
+            for column in range(6)
+        )
+        real_cap = Detection("tube_cap", 0.91, Box(144, 144, 156, 156))
+        screw_false_positive = Detection(
+            "tube_cap",
+            0.63,
+            Box(92, 92, 108, 108),
+        )
+
+        matches = _match_caps_to_slots(
+            [real_cap, screw_false_positive],
+            projected,
+            pose(),
+            maximum_distance_factor=0.45,
+        )
+
+        self.assertEqual(
+            matches,
+            {SlotAddress("rack_1", 1, 1): real_cap},
+        )
+
     def test_multi_frame_pose_plane_cap_and_grid_pipeline(self) -> None:
         color = np.zeros((400, 600, 3), dtype=np.uint8)
-        cv2.circle(color, (140, 140), 6, (0, 0, 255), -1)
         depth = np.full((400, 600), 1000.0, dtype=np.float32)
-        depth[144:157, 144:157] = 953.0
+        depth[144:157, 164:177] = 953.0
         samples = []
         for index in range(5):
             frame = CameraFrame(
@@ -57,6 +88,11 @@ class PosePipelineTests(unittest.TestCase):
         calibration = calibrate_slot_grid(
             "rack_1", pose(), Pixel(150, 150), Pixel(450, 250)
         )
+        calibration = calibrate_display_corners(
+            calibration,
+            pose(),
+            pose().corners,
+        )
         vision = PoseRackVision(
             rack_pose_detector=_PoseDetector(),
             cap_detector=_CapDetector(),
@@ -65,12 +101,6 @@ class PosePipelineTests(unittest.TestCase):
             pose_quality=RackPoseQualityConfig(
                 minimum_rack_area_px2=10_000,
                 maximum_opposite_side_ratio=1.2,
-                screw_edge_margin=0.02,
-                k0_red_patch_radius_px=12,
-                k0_red_minimum_ratio=0.05,
-                k0_red_minimum_ratio_margin=0.03,
-                k0_red_minimum_saturation=100,
-                k0_red_minimum_value=80,
             ),
             stability=RackStabilityConfig(
                 capture_frames=5,
@@ -99,7 +129,6 @@ class PosePipelineTests(unittest.TestCase):
                 cap_top_above_rack_mm=47,
                 maximum_cap_height_error_mm=1,
                 cap_slot_max_distance_factor=0.45,
-                maximum_calibration_keypoint_shift_ratio=0.03,
             ),
         )
         observation = vision.observe(samples, "rack_1")
@@ -112,6 +141,14 @@ class PosePipelineTests(unittest.TestCase):
             953.0,
             places=3,
         )
+        self.assertAlmostEqual(
+            source.cap_top_base.x_mm,  # type: ignore[union-attr]
+            source.hole_on_plane_base.x_mm,  # type: ignore[union-attr]
+        )
+        self.assertAlmostEqual(
+            source.cap_top_base.y_mm,  # type: ignore[union-attr]
+            source.hole_on_plane_base.y_mm,  # type: ignore[union-attr]
+        )
         self.assertTrue(
             all(
                 slot.occupancy is Occupancy.EMPTY
@@ -119,10 +156,42 @@ class PosePipelineTests(unittest.TestCase):
             )
         )
 
+        visual = vision.detect_visual(color, "rack_1")
+        self.assertIsNotNone(visual.pose)
+        self.assertEqual(len(visual.display_corners), 4)
+        self.assertEqual(len(visual.projected_slots), 12)
+        self.assertEqual(len(visual.caps), 1)
+        self.assertEqual(visual.rack_error, "")
+
+        missing_depth_samples = []
+        for index, sample in enumerate(samples):
+            missing_depth = np.asarray(sample.frame.depth_mm).copy()
+            missing_depth[144:157, 164:177] = 0.0
+            missing_depth_samples.append(
+                CapturedRackFrame(
+                    CameraFrame(
+                        color=sample.frame.color,
+                        depth_mm=missing_depth,
+                        intrinsics=sample.frame.intrinsics,
+                        timestamp_ms=float(index),
+                        frame_number=index,
+                    ),
+                    sample.arm_pose,
+                )
+            )
+        fallback = vision.observe(missing_depth_samples, "rack_1")
+        fallback_source = fallback.slot(SlotAddress("rack_1", 1, 1))
+        self.assertIs(fallback_source.occupancy, Occupancy.OCCUPIED)
+        self.assertAlmostEqual(
+            fallback_source.cap_top_base.z_mm,  # type: ignore[union-attr]
+            953.0,
+            places=3,
+        )
+
         elevated_samples = []
         for index, sample in enumerate(samples):
             elevated_depth = np.asarray(sample.frame.depth_mm).copy()
-            elevated_depth[144:157, 144:157] = 900.0
+            elevated_depth[144:157, 164:177] = 900.0
             elevated_samples.append(
                 CapturedRackFrame(
                     CameraFrame(

@@ -3,7 +3,7 @@
 runtime:
   # fake: no hardware; real: D435 + RealMan arm + gripper
   # Keep fake until every item in docs/LAB_CHECKLIST.md has passed.
-  mode: fake
+  mode: real
   require_enter_before_motion: true
   save_debug_images: true
   observation_position_tolerance_mm: 5.0
@@ -11,6 +11,9 @@ runtime:
   scene_recheck_pixel_tolerance_px: 5.0
   scene_recheck_position_tolerance_mm: 2.0
   scene_recheck_plane_tolerance_mm: 2.0
+  # Wrist view above the destination cannot see all four rack screws while a
+  # tube is held. Reuse the last complete pre-grasp scan for placement.
+  destination_recheck_while_carrying: false
 
 agent:
   # local: offline parser for canonical rack_1.r1c1 addresses
@@ -38,10 +41,15 @@ arm:
   tool_frame: "Arm_Tip"
   reject_conflicting_processes: true
   conflicting_processes: [atom, zhixing_ctrl.py]
-  transit_speed_percent: 10
-  approach_speed_percent: 5
+  transit_speed_percent: 15
+  approach_speed_percent: 10
 
 gripper:
+  # 2026-07-28/2026-08-15 真机验证：ZX 1DOF RM Plus 只在 9600 在线。
+  baudrate: 9600
+  tool_voltage: 3
+  speed: 100
+  force: 30
   open_position: 170
   grip_position: 135
   reset_position: 1
@@ -50,6 +58,8 @@ gripper:
   poll_interval_s: 0.1
   state_read_attempts: 6
   state_read_retry_s: 0.25
+  power_on_wait_s: 1.0
+  protocol_startup_wait_s: 0.8
 
 vision:
   # Final deployment uses the first local CUDA GPU. doctor rejects real mode
@@ -58,31 +68,34 @@ vision:
   cap:
     model_path: "models/cap.pt"
     class_names:
-      0: tube_cap
-    confidence: 0.50
+      # The supplied weight metadata uses the generic training class `item`.
+      0: item
+    confidence: 0.60
     iou: 0.45
     image_size: 1280
     depth_window_px: 7
     maximum_height_error_mm: 4.0
-  rack_pose:
-    model_path: "models/rack_pose.pt"
+  screw:
+    model_path: "models/screw.pt"
     class_names:
-      0: rack_surface
-    # Fixed annotation/output order. K0..K3 are clockwise rack corners.
-    keypoint_names: [k0, k1, k2, k3, screw_k0, screw_k1, screw_k2, screw_k3]
-    confidence: 0.65
-    keypoint_confidence: 0.60
+      0: item
+    confidence: 0.40
     iou: 0.45
-    image_size: 1280
+    # screw.pt was trained/refined at native 1920 resolution.
+    image_size: 1920
     minimum_rack_area_px2: 20000
     maximum_opposite_side_ratio: 1.35
-    screw_edge_margin: 0.03
-    k0_red_marker:
-      patch_radius_px: 14
-      minimum_red_ratio: 0.05
-      minimum_ratio_margin: 0.03
-      minimum_saturation: 100
-      minimum_value: 80
+    marker:
+      # Extra white marker beside K0; screw boxes themselves are masked first.
+      # Keep the tape isolated on the green rack instead of touching the white base.
+      minimum_value: 145
+      maximum_saturation: 100
+      search_radius_factor: 0.45
+      screw_exclusion_scale: 1.30
+      minimum_area_px2: 18
+      maximum_area_ratio: 4.0
+      minimum_score_ratio: 1.25
+      minimum_rack_aspect_ratio: 1.50
   calibration:
     # Click near each endpoint slot; Hough fit supplies the initial circle.
     search_radius_px: 70
@@ -94,11 +107,13 @@ vision:
     hough_edge_threshold: 100.0
     hough_accumulator_threshold: 16.0
   stability:
-    capture_frames: 7
+    # Capture a wider window and keep requiring at least five complete frames,
+    # so intermittent detector misses do not abort after only seven attempts.
+    capture_frames: 12
     minimum_inlier_frames: 5
     maximum_frame_residual_px: 3.0
     maximum_keypoint_spread_px: 3.0
-    minimum_occupancy_agreement: 0.80
+    minimum_occupancy_agreement: 0.70
     maximum_slot_position_spread_mm: 2.5
     maximum_cap_position_spread_mm: 3.0
   plane:
@@ -110,11 +125,15 @@ vision:
     minimum_inliers: 250
     minimum_inlier_ratio: 0.35
     maximum_rms_error_mm: 1.5
+    # Controller rm_get_install_pose reports y=45 deg.  In base_right this is
+    # the physical rack-up direction (toward the wrist camera), not base +Z.
+    expected_normal_base: [-0.70710678, 0.0, 0.70710678]
     maximum_tilt_deg: 8.0
   matching:
-    cap_slot_max_distance_factor: 0.45
-    # Viewpoint-invariant distance in normalized rack coordinates.
-    maximum_calibration_keypoint_shift_ratio: 0.04
+    # Current observation geometry has about 91 px slot spacing.  0.68 gives
+    # an approximately 62 px gate, covering the measured 58.8 px offset while
+    # retaining multi-frame occupancy and 3-D height validation.
+    cap_slot_max_distance_factor: 0.68
 
 racks:
   rack_1:
@@ -124,32 +143,44 @@ racks:
 
 geometry:
   hand_eye_path: "config/hand_eye.yaml"
-  # Provisional flange -> gripper TCP offset. Measure the final tool before
-  # setting motion.parameters_confirmed to true.
-  tcp_offset_end_mm: [0.0, 0.0, 220.0]
-  # Provisional value. Remeasure with the final rack and seated tube.
+  # Tuned for the current rig. Every new installation must remeasure this
+  # before setting motion.parameters_confirmed to true.
+  tcp_offset_end_mm: [-3.000, -14.000, 220.000]
+  # Placement-only TCP: moves the physical gripper 3 mm along end -Y relative
+  # to the pick TCP (software offset uses the opposite sign).
+  destination_tcp_offset_end_mm: [-3.000, -11.000, 220.000]
+  # Current-rig value. Remeasure with the final rack and seated tube.
   cap_top_above_rack_mm: 47.0
-  grasp_depth_below_cap_mm: 5.0
-  # Positive: place shallower (higher Z). Negative: place deeper (lower Z).
+  # Operator-tuned grasp geometry: 20 mm old-project depth plus 5 mm.
+  grasp_depth_below_cap_mm: 28.0
+  # Positive: place shallower (farther from rack). Negative: place deeper.
   seating_adjust_mm: 0.0
-  # Provisional value from the old tube; remeasure the final tube.
+  # Current-rig value; remeasure when the tube type changes.
   tube_total_length_mm: 120.0
   required_carried_clearance_mm: 30.0
 
 motion:
-  # Set true only after checking TCP offset, workspace and all vertical heights
-  # on the physical right arm at low speed.
-  parameters_confirmed: false
+  # Set true only after checking TCP offset, workspace and all rack-normal
+  # motion heights on the physical right arm at low speed.
+  parameters_confirmed: true
+  # 真机测试时，每次扫描、夹爪动作和机械臂航点前必须空回车确认。
+  confirm_each_step: true
   poses_path: "config/poses.yaml"
   approach_height_mm: 50.0
-  # 150 mm keeps the carried tube above neighbouring tube caps during XY travel.
+  # 150 mm keeps the carried tube away from neighbouring caps during transfer.
   retreat_height_mm: 150.0
-  maximum_orientation_error_deg: 5.0
   # Reused from the proven AprilTag global-observation move gate.
   maximum_single_orientation_change_deg: 30.0
-  maximum_tool_tilt_deg: 1.0
+  # Same gate as the proven AprilTag planner: only a small correction from the
+  # current tool axis to the measured rack normal is allowed.
+  maximum_tool_axis_misalignment_deg: 15.0
   maximum_single_move_mm: 500.0
-  position_reached_tolerance_mm: 1.0
+  # Wait for controller/mechanics to settle before reading reached pose.
+  reached_check_settle_s: 1.0
+  position_reached_tolerance_mm: 2.0
   orientation_reached_tolerance_deg: 0.5
-  workspace_min_mm: [-50.0, 200.0, -250.0]
-  workspace_max_mm: [200.0, 550.0, -40.0]
+  # Verified with pick TCP [-3,-14,220], placement TCP [-3,-11,220], and
+  # 28 mm grasp depth. Planned flange envelope is
+  # [31.69,294.90,-86.94] to [205.58,408.20,86.72] mm.
+  workspace_min_mm: [0.0, 270.0, -110.0]
+  workspace_max_mm: [250.0, 435.0, 200.0]

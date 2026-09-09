@@ -1,4 +1,4 @@
-"""Multi-frame rack pose, plane, slot-grid and tube-cap perception."""
+"""Multi-frame four-screw rack, plane, slot-grid and tube-cap perception."""
 
 from __future__ import annotations
 
@@ -32,7 +32,6 @@ from tube_grabber.vision.rack_pose import (
     RackPoseQualityConfig,
     RackPoseStability,
     fuse_rack_pose_detections,
-    validate_k0_red_marker,
     validate_rack_pose_geometry,
 )
 
@@ -44,6 +43,17 @@ TUBE_CAP = "tube_cap"
 class CapturedRackFrame:
     frame: CameraFrame
     arm_pose: Pose6D
+
+
+@dataclass(frozen=True)
+class RackVisualDetection:
+    """One-frame 2D overlays for the live scan window."""
+
+    display_corners: tuple[Pixel, ...]
+    caps: tuple[Detection, ...]
+    pose: RackPoseDetection | None
+    projected_slots: tuple[tuple[SlotAddress, Pixel], ...]
+    rack_error: str = ""
 
 
 @dataclass(frozen=True)
@@ -85,7 +95,6 @@ class RackMatchingConfig:
     cap_top_above_rack_mm: float
     maximum_cap_height_error_mm: float
     cap_slot_max_distance_factor: float
-    maximum_calibration_keypoint_shift_ratio: float
 
     def __post_init__(self) -> None:
         if self.depth_window_px <= 0 or self.depth_window_px % 2 == 0:
@@ -101,7 +110,6 @@ class RackMatchingConfig:
             "cap_top_above_rack_mm",
             "maximum_cap_height_error_mm",
             "cap_slot_max_distance_factor",
-            "maximum_calibration_keypoint_shift_ratio",
         ):
             value = float(getattr(self, name))
             if not isfinite(value) or value <= 0.0:
@@ -124,7 +132,7 @@ class _FrameObservation:
 
 
 class PoseRackVision:
-    """Final vision path: one pose model, one cap detector, no hole detector."""
+    """Final vision path: four screws, one cap detector, no hole detector."""
 
     def __init__(
         self,
@@ -154,11 +162,74 @@ class PoseRackVision:
     def capture_frames(self) -> int:
         return self._stability.capture_frames
 
+    def detect_visual(
+        self,
+        color_image: object,
+        rack_id: str,
+    ) -> RackVisualDetection:
+        """Run one-frame cap/screw inference and project calibrated slot centers."""
+        if rack_id not in self._calibrations:
+            raise VisionError(f"unknown rack id: {rack_id}")
+        calibration = self._calibrations[rack_id]
+        if calibration is None:
+            raise VisionError(
+                f"{rack_id} has no two-circle calibration; run calibrate-rack"
+            )
+
+        caps = tuple(self._cap_detector.detect(color_image))
+        unsupported = sorted({cap.label for cap in caps if cap.label != TUBE_CAP})
+        if unsupported:
+            raise VisionError(
+                f"cap detector returned unsupported labels: {unsupported}"
+            )
+
+        detect_screws = getattr(self._pose_detector, "detect_screws", None)
+        build_rack = getattr(self._pose_detector, "build_rack_detection", None)
+        if callable(detect_screws) and callable(build_rack):
+            screws = tuple(detect_screws(color_image))
+            try:
+                pose = build_rack(color_image, screws)
+                validate_rack_pose_geometry(
+                    pose,
+                    minimum_area_px2=self._pose_quality.minimum_rack_area_px2,
+                    maximum_opposite_side_ratio=(
+                        self._pose_quality.maximum_opposite_side_ratio
+                    ),
+                )
+            except VisionError as exc:
+                return RackVisualDetection(
+                    display_corners=(),
+                    caps=caps,
+                    pose=None,
+                    projected_slots=(),
+                    rack_error=str(exc),
+                )
+        else:
+            # Keeps the API usable by alternate/fake rack detectors.
+            pose = self._pose_detector.detect(color_image)
+            validate_rack_pose_geometry(
+                pose,
+                minimum_area_px2=self._pose_quality.minimum_rack_area_px2,
+                maximum_opposite_side_ratio=(
+                    self._pose_quality.maximum_opposite_side_ratio
+                ),
+            )
+        return RackVisualDetection(
+            display_corners=(
+                calibration.project_display_corners(pose)
+                if calibration.display_corners_calibrated
+                else ()
+            ),
+            caps=caps,
+            pose=pose,
+            projected_slots=calibration.project_slots(pose),
+        )
+
     def detect_stable_pose(
         self,
         samples: Sequence[CapturedRackFrame],
     ) -> tuple[RackPoseStability, tuple[_PoseFrame, ...]]:
-        """Run pose inference on every frame, then median-filter valid frames."""
+        """Infer four screw centers on every frame, then median-filter them."""
         valid: list[_PoseFrame] = []
         failures: list[str] = []
         for index, sample in enumerate(samples):
@@ -170,20 +241,6 @@ class PoseRackVision:
                     maximum_opposite_side_ratio=(
                         self._pose_quality.maximum_opposite_side_ratio
                     ),
-                    screw_edge_margin=self._pose_quality.screw_edge_margin,
-                )
-                validate_k0_red_marker(
-                    sample.frame.color,
-                    detection,
-                    patch_radius_px=self._pose_quality.k0_red_patch_radius_px,
-                    minimum_red_ratio=self._pose_quality.k0_red_minimum_ratio,
-                    minimum_ratio_margin=(
-                        self._pose_quality.k0_red_minimum_ratio_margin
-                    ),
-                    minimum_saturation=(
-                        self._pose_quality.k0_red_minimum_saturation
-                    ),
-                    minimum_value=self._pose_quality.k0_red_minimum_value,
                 )
                 valid.append(_PoseFrame(index, sample, detection))
             except VisionError as exc:
@@ -191,7 +248,7 @@ class PoseRackVision:
         if len(valid) < self._stability.minimum_inlier_frames:
             detail = "; ".join(failures[:3])
             raise VisionError(
-                "rack pose valid frames "
+                "valid four-screw rack frames "
                 f"{len(valid)} < {self._stability.minimum_inlier_frames}"
                 + (f"; {detail}" if detail else "")
             )
@@ -205,7 +262,6 @@ class PoseRackVision:
             maximum_opposite_side_ratio=(
                 self._pose_quality.maximum_opposite_side_ratio
             ),
-            screw_edge_margin=self._pose_quality.screw_edge_margin,
         )
         inlier_frames = tuple(valid[index] for index in relative.inlier_indices)
         stability = RackPoseStability(
@@ -245,10 +301,6 @@ class PoseRackVision:
                 f"{len(samples)} < {self._stability.minimum_inlier_frames}"
             )
         stability, inlier_frames = self.detect_stable_pose(samples)
-        calibration.validate_reference_pose(
-            stability.detection,
-            self._matching.maximum_calibration_keypoint_shift_ratio,
-        )
         observations: list[_FrameObservation] = []
         failures: list[str] = []
         for item in inlier_frames:
@@ -317,50 +369,71 @@ class PoseRackVision:
                     )
                 )
                 continue
-            depth_mm = sample_depth_mm(
-                sample.frame.depth_mm,
-                cap.box.center,
-                self._matching.depth_window_px,
-                self._matching.depth_min_mm,
-                self._matching.depth_max_mm,
-            )
-            cap_point = pixel_depth_to_base(
-                cap.box.center,
-                depth_mm,
-                sample.frame.intrinsics,
-                transform,
-            )
-            cap_height = plane.signed_distance_mm(cap_point)
-            height_error = abs(
-                cap_height - self._matching.cap_top_above_rack_mm
-            )
-            if height_error > self._matching.maximum_cap_height_error_mm:
-                if (
-                    address == ignored_elevated_slot
-                    and cap_height
-                    > self._matching.cap_top_above_rack_mm
-                    + self._matching.maximum_cap_height_error_mm
-                ):
-                    # During destination recheck, the one carried tube is
-                    # deliberately parked above the requested empty slot.  Its
-                    # elevated cap may project onto that slot, but it is not a
-                    # seated occupant.  Every other high/low mismatch remains
-                    # a hard failure.
-                    slots.append(
-                        SlotObservation(
-                            address=address,
-                            occupancy=Occupancy.EMPTY,
-                            confidence=item.pose.confidence,
-                            pixel=slot_pixel,
-                            hole_on_plane_base=hole,
-                        )
-                    )
-                    continue
-                raise VisionError(
-                    f"{address.text} cap height {cap_height:.2f}mm differs from "
-                    f"{self._matching.cap_top_above_rack_mm:.2f}mm "
-                    f"by {height_error:.2f}mm"
+            try:
+                depth_mm = sample_depth_mm(
+                    sample.frame.depth_mm,
+                    cap.box.center,
+                    self._matching.depth_window_px,
+                    self._matching.depth_min_mm,
+                    self._matching.depth_max_mm,
                 )
+            except VisionError as exc:
+                if not str(exc).startswith("no valid depth around pixel"):
+                    raise
+                # Reflective cap surfaces can leave a local D435 depth hole.
+                # Repeated cap detection still establishes occupancy, so use
+                # the configured seated-cap height for this frame.
+                cap_height = self._matching.cap_top_above_rack_mm
+            else:
+                measured_cap = pixel_depth_to_base(
+                    cap.box.center,
+                    depth_mm,
+                    sample.frame.intrinsics,
+                    transform,
+                )
+                cap_height = plane.signed_distance_mm(measured_cap)
+                height_error = abs(
+                    cap_height - self._matching.cap_top_above_rack_mm
+                )
+                if height_error > self._matching.maximum_cap_height_error_mm:
+                    if (
+                        address == ignored_elevated_slot
+                        and cap_height
+                        > self._matching.cap_top_above_rack_mm
+                        + self._matching.maximum_cap_height_error_mm
+                    ):
+                        # During destination recheck, the one carried tube is
+                        # deliberately parked above the requested empty slot.  Its
+                        # elevated cap may project onto that slot, but it is not a
+                        # seated occupant.  Every other high/low mismatch remains
+                        # a hard failure.
+                        slots.append(
+                            SlotObservation(
+                                address=address,
+                                occupancy=Occupancy.EMPTY,
+                                confidence=item.pose.confidence,
+                                pixel=slot_pixel,
+                                hole_on_plane_base=hole,
+                            )
+                        )
+                        continue
+                    raise VisionError(
+                        f"{address.text} cap height {cap_height:.2f}mm differs from "
+                        f"{self._matching.cap_top_above_rack_mm:.2f}mm "
+                        f"by {height_error:.2f}mm"
+                    )
+
+            # A seated tube is constrained by its calibrated rack slot.  Keep
+            # the grasp laterally centered on that slot and use cap sensing only
+            # for occupancy and height.  An off-center detection box must not
+            # pull the planned TCP away from the physical hole.
+            normal = plane.normal_base
+            cap_point = Point3D(
+                hole.x_mm + cap_height * normal[0],
+                hole.y_mm + cap_height * normal[1],
+                hole.z_mm + cap_height * normal[2],
+                frame=hole.frame,
+            )
             slots.append(
                 SlotObservation(
                     address=address,
@@ -462,10 +535,26 @@ class PoseRackVision:
                 ]
             )
         )
-        keypoints = tuple(item.pixel for item in stability.detection.keypoints)
+        normals = np.asarray(
+            [frame.plane.normal_base for frame in frames],
+            dtype=np.float64,
+        )
+        approach = np.mean(normals, axis=0)
+        approach_length = float(np.linalg.norm(approach))
+        if approach_length <= 1e-9:
+            raise VisionError("rack plane normals cancel across stable frames")
+        approach /= approach_length
+        calibration = self._calibrations[rack_id]
+        if calibration is None:  # Guarded by observe(); keeps this method total.
+            raise VisionError(f"{rack_id} has no rack calibration")
+        keypoints = (
+            calibration.project_display_corners(stability.detection)
+            if calibration.display_corners_calibrated
+            else ()
+        )
         return RackObservation(
             rack_id=rack_id,
-            marker=keypoints[0],
+            marker=(keypoints[0] if keypoints else stability.detection.corners[0]),
             plane_z_mm=plane_z,
             slots=tuple(slots),
             timestamp_ms=float(np.median([frame.timestamp_ms for frame in frames])),
@@ -473,6 +562,7 @@ class PoseRackVision:
             stability_frame_count=len(frames),
             maximum_keypoint_spread_px=stability.maximum_keypoint_spread_px,
             maximum_position_spread_mm=maximum_position_spread,
+            approach_axis_base=tuple(float(value) for value in approach),
         )
 
 
@@ -511,6 +601,14 @@ def _match_caps_to_slots(
             False,
         )
         >= 0
+        # cap.pt can intermittently classify a dark corner screw as a tube
+        # cap.  A real seated cap cannot cover one of the four rack landmark
+        # centers, so discard only that unambiguous cross-model collision.
+        and not any(
+            detection.box.x1 <= corner.u <= detection.box.x2
+            and detection.box.y1 <= corner.v <= detection.box.y2
+            for corner in pose.corners
+        )
     ]
     pairs = []
     for cap_index, cap in enumerate(inside):

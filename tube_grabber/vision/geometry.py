@@ -110,6 +110,11 @@ def camera_ray(pixel: Pixel, intrinsics: CameraIntrinsics) -> np.ndarray:
             dtype=np.float64,
         )
 
+    # librealsense 2.56 deprojects the D435 profile reported as
+    # inverse_brown_conrady consistently with OpenCV's Brown-Conrady
+    # undistortion for the five supplied coefficients.  Preserve the model
+    # name at capture time, but use the same calibrated pixel->ray operation
+    # here for both supported Brown-Conrady variants.
     camera_matrix = np.array(
         [
             [intrinsics.fx, 0.0, intrinsics.cx],

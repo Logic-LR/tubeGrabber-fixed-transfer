@@ -11,8 +11,9 @@ Agent 只负责把一条文本命令转换为 `TransferCommand`。`agent-plan` �
 
 跨架命令可以被 Gemini 理解，但在导航实现前仍由现有同架安全锁拒绝。即使使用
 `agent-transfer`，Gemini 也只生成结构化命令；Python 项目仍负责所有校验和运动执行。
-真机模式下先确认空载并输入 `EMPTY`，程序自动进入观察位；预览后还必须输入 `MOVE`
-才会开始抓放。携管目标复检、最新坐标重规划和最终闭环复扫不能被 Agent 绕过。
+真机模式下先确认空载并按 Enter，程序自动进入观察位；预览后还必须再次按 Enter
+才会开始抓放，输入 `q` 可取消。执行前复扫、最新坐标重规划和最终闭环复扫不能被
+Agent 绕过。
 
 ## 离线模式
 
@@ -58,8 +59,8 @@ python -m tube_grabber agent-transfer --agent-provider gemini --text "把一号�
 ```
 
 在 `runtime.mode: fake` 下，该命令只驱动假硬件。切换到 `real` 后，它才会连接真实设备，
-并继续受到运动参数确认、自动观察位、同架限制、`EMPTY`/`MOVE` 授权、执行前复扫、携管
-目标复检和最终闭环验证保护。
+并继续受到运动参数确认、自动观察位、同架限制、两次 Enter 授权、执行前复扫和最终
+闭环验证保护。
 
 Gemini 不会获得任何机械臂函数。它只能提出 `propose_transfer` 的六个参数；自动函数调用被关闭，Python 再检查：
 
@@ -83,4 +84,5 @@ API不可用、模型输出不完整或参数非法时，命令以错误或澄�
 | `agent/factory.py` | 根据 YAML 选择实现 |
 | `cli.py` | `agent-plan` 和 `agent-transfer` 操作者入口 |
 
-未来接入语音时，只需把 ASR 文本传给 `CommandAgent.interpret()`；不要在 `speech/` 中复制任务解析或运动逻辑。
+未来接入语音时，只需把 ASR 文本传给 `CommandAgent.interpret()`，不能复制任务解析或
+绕过运动安全门禁。

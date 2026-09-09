@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import multiprocessing
 import os
+import queue
 import sys
+import threading
 from typing import Any, Sequence
 
 import cv2
@@ -32,11 +35,13 @@ from tube_grabber.vision.geometry import validate_transform
 from tube_grabber.vision.rack_calibration import (
     RackCircleFitConfig,
     SlotCircle,
+    calibrate_display_corners,
     calibrate_slot_grid,
     fit_slot_circle,
     load_rack_calibration,
     save_rack_calibration,
 )
+from tube_grabber.vision.pose_pipeline import RackVisualDetection
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -58,9 +63,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "gripper-status":
             return _gripper_status(runtime)
         if args.command == "scan":
-            return _scan(runtime, config, args.rack)
+            return _scan(
+                runtime,
+                config,
+                args.rack,
+                display=not args.no_display,
+            )
         if args.command == "calibrate-rack":
             return _calibrate_rack(runtime, config, args.rack, force=args.force)
+        if args.command == "calibrate-corners":
+            return _calibrate_corners(runtime, config, args.rack)
         if args.command in ("agent-plan", "agent-transfer"):
             return _agent_command(
                 runtime,
@@ -114,6 +126,11 @@ def _parser() -> argparse.ArgumentParser:
 
     scan = subparsers.add_parser("scan", help="识别一个固定站的 2x6 试管架")
     scan.add_argument("--rack", required=True, choices=("rack_1", "rack_2"))
+    scan.add_argument(
+        "--no-display",
+        action="store_true",
+        help="不打开实时窗口，只执行一次稳定扫描并退出",
+    )
     calibrate = subparsers.add_parser(
         "calibrate-rack",
         help="正上方多帧识别后拟合并微调 r1c1/r2c6 槽圆",
@@ -124,6 +141,11 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="明确覆盖该 rack 已存在的双圆心标定",
     )
+    corners = subparsers.add_parser(
+        "calibrate-corners",
+        help="用四螺丝架面标定演示画面的 K0-K3 四个交点",
+    )
+    corners.add_argument("--rack", required=True, choices=("rack_1", "rack_2"))
 
     plan = subparsers.add_parser(
         "plan-transfer",
@@ -231,16 +253,16 @@ def _doctor(config: dict[str, Any]) -> int:
 
     motion_confirmed = bool(config["motion"].get("parameters_confirmed", False))
     if motion_confirmed:
-        _status("OK", "TCP、工作空间和竖直运动高度已真机确认")
+        _status("OK", "TCP、工作空间和架面法向运动高度已真机确认")
     else:
         level = "FAIL" if mode == "real" else "WAIT"
-        _status(level, "TCP、工作空间和竖直运动高度尚未真机确认")
+        _status(level, "TCP、工作空间和架面法向运动高度尚未真机确认")
         if mode == "real":
             failures.append("motion parameters")
 
     for model_name, model_config in (
         ("试管盖 detection", config["vision"]["cap"]),
-        ("架面八点 pose", config["vision"]["rack_pose"]),
+        ("架面四螺丝 detection", config["vision"]["screw"]),
     ):
         model_path = project_path(model_config["model_path"])
         if model_path.is_file():
@@ -253,14 +275,14 @@ def _doctor(config: dict[str, Any]) -> int:
 
     model_paths = (
         project_path(config["vision"]["cap"]["model_path"]),
-        project_path(config["vision"]["rack_pose"]["model_path"]),
+        project_path(config["vision"]["screw"]["model_path"]),
     )
     if all(path.is_file() for path in model_paths) and _module_exists(
         "ultralytics"
     ):
         try:
             _validate_model_contracts(*model_paths)
-            _status("OK", "两个 YOLO 权重的类别和 Pose 8×3 契约正确")
+            _status("OK", "cap/screw 两个 YOLO detection 权重契约正确")
         except Exception as error:
             _status("FAIL", f"YOLO 权重契约错误：{error}")
             failures.append("model contracts")
@@ -679,6 +701,181 @@ def _rack_circle_fit_config(data: dict[str, Any]) -> RackCircleFitConfig:
     )
 
 
+def _calibrate_corners(
+    runtime: TubeGrabberRuntime,
+    config: dict[str, Any],
+    rack_id: str,
+) -> int:
+    """Teach four presentation corners relative to the detected screw plane."""
+    if runtime.mode != "real" or not isinstance(runtime.observer, CameraRackObserver):
+        raise ConfigError("calibrate-corners requires runtime.mode: real")
+    output = project_path(config["racks"][rack_id]["calibration_path"])
+    calibration = load_rack_calibration(output, rack_id)
+    window = f"calibrate {rack_id}: K0-K3 display corners"
+    try:
+        runtime.start(need_arm=True, need_camera=True, need_gripper=False)
+        frame, stability = runtime.observer.capture_stable_pose()
+        image = np.asarray(frame.color)
+        screw_pose = stability.detection
+        taught = list(calibration.project_display_corners(screw_pose))
+        active_index = 0
+        dragging = False
+
+        def on_mouse(
+            event: int,
+            x: int,
+            y: int,
+            flags: int,
+            _data: object,
+        ) -> None:
+            nonlocal dragging
+            if active_index >= 4:
+                return
+            if event == cv2.EVENT_LBUTTONDOWN:
+                dragging = True
+                taught[active_index] = Pixel(float(x), float(y))
+            elif event == cv2.EVENT_MOUSEMOVE and (
+                dragging or flags & cv2.EVENT_FLAG_LBUTTON
+            ):
+                taught[active_index] = Pixel(float(x), float(y))
+            elif event == cv2.EVENT_LBUTTONUP:
+                dragging = False
+
+        try:
+            cv2.namedWindow(window, cv2.WINDOW_AUTOSIZE)
+            cv2.setMouseCallback(window, on_mouse)
+            while True:
+                preview = image.copy()
+
+                # Screw centers are deliberately visible only in calibration.
+                for point in screw_pose.corners:
+                    center = (int(round(point.u)), int(round(point.v)))
+                    cv2.drawMarker(
+                        preview,
+                        center,
+                        (120, 120, 120),
+                        cv2.MARKER_CROSS,
+                        8,
+                        1,
+                        cv2.LINE_AA,
+                    )
+
+                taught_array = np.asarray(
+                    [[round(point.u), round(point.v)] for point in taught],
+                    dtype=np.int32,
+                )
+                cv2.polylines(
+                    preview,
+                    [taught_array],
+                    True,
+                    (255, 0, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+                for index, point in enumerate(taught):
+                    center = (int(round(point.u)), int(round(point.v)))
+                    color = (
+                        (0, 165, 255)
+                        if index == active_index
+                        else (255, 0, 255)
+                    )
+                    cv2.circle(preview, center, 4, color, 1, cv2.LINE_AA)
+                    cv2.putText(
+                        preview,
+                        f"K{index}",
+                        (center[0] + 5, center[1] - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.42,
+                        color,
+                        1,
+                        cv2.LINE_AA,
+                    )
+
+                result = None
+                corner_error = ""
+                if active_index >= 4:
+                    try:
+                        result = calibrate_display_corners(
+                            calibration,
+                            screw_pose,
+                            taught,
+                        )
+                    except VisionError as error:
+                        corner_error = str(error)
+
+                status = (
+                    f"target={'DONE' if active_index >= 4 else f'K{active_index}'} | "
+                    "click/drag or I/J/K/L | Enter=confirm | Backspace=previous"
+                )
+                cv2.putText(
+                    preview,
+                    status,
+                    (18, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (0, 255, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+                hint = corner_error or "R=reset | S=save after K3 | Q=cancel"
+                cv2.putText(
+                    preview,
+                    hint[:120],
+                    (18, 56),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.50,
+                    (0, 0, 255) if corner_error else (0, 255, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+                cv2.imshow(window, preview)
+                key = cv2.waitKeyEx(20)
+                low_key = key & 0xFF
+                if low_key in (ord("q"), 27):
+                    raise ConfigError("corner calibration cancelled")
+                if low_key == ord("r"):
+                    taught = list(screw_pose.corners)
+                    active_index = 0
+                elif low_key in (8, 127):
+                    active_index = max(0, active_index - 1)
+                elif low_key in (13, 10, 32) and active_index < 4:
+                    active_index += 1
+                elif active_index < 4:
+                    movement = _circle_key_movement(key, low_key)
+                    if movement is not None:
+                        point = taught[active_index]
+                        taught[active_index] = Pixel(
+                            float(
+                                np.clip(
+                                    point.u + movement[0], 0, image.shape[1] - 1
+                                )
+                            ),
+                            float(
+                                np.clip(
+                                    point.v + movement[1], 0, image.shape[0] - 1
+                                )
+                            ),
+                        )
+                if low_key == ord("s") and result is not None:
+                    saved = save_rack_calibration(result, output, force=True)
+                    print(
+                        f"已保存 {rack_id} 四角点展示标定：{saved}\n"
+                        "底层仍为四螺丝 DET；scan 只绘制标定后的 K0-K3。"
+                    )
+                    return 0
+        except cv2.error as exc:
+            raise ConfigError(
+                "cannot open the corner calibration window; run from a desktop session"
+            ) from exc
+        finally:
+            try:
+                cv2.destroyWindow(window)
+            except cv2.error:
+                pass
+    finally:
+        runtime.close()
+
+
 def _draw_slot_circle(
     image: np.ndarray,
     circle: SlotCircle,
@@ -757,6 +954,8 @@ def _scan(
     runtime: TubeGrabberRuntime,
     config: dict[str, Any],
     rack_id: str,
+    *,
+    display: bool = True,
 ) -> int:
     try:
         runtime.start(
@@ -765,6 +964,8 @@ def _scan(
             need_gripper=False,
         )
         runtime.require_observation_pose()
+        if display and runtime.mode == "real":
+            return _live_scan(runtime, config, rack_id)
         observation = runtime.workflow.scan(rack_id)
         print(format_observation(observation))
         _save_scan_if_available(runtime, config)
@@ -774,6 +975,373 @@ def _scan(
         raise
     finally:
         runtime.close()
+
+
+def _live_scan(
+    runtime: TubeGrabberRuntime,
+    config: dict[str, Any],
+    rack_id: str,
+) -> int:
+    if not isinstance(runtime.observer, CameraRackObserver):
+        raise VisionError("实时扫描需要 D435 相机观察器")
+    window = f"{rack_id} live scan | S/SPACE/ENTER scan | Q/ESC quit"
+    try:
+        cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+    except cv2.error as exc:
+        raise VisionError(
+            "无法创建 OpenCV 窗口；图形环境不可用时请添加 --no-display"
+        ) from exc
+
+    print("实时窗口已启动：按 s、空格或 Enter 完成一次稳定扫描；按 q/ESC 退出。")
+    scan_count = 0
+    try:
+        while True:
+            frame, visual = runtime.observer.capture_visual(rack_id)
+            preview = np.asarray(frame.color).copy()
+            _draw_live_scan_overlay(preview, visual)
+            status = (
+                f"CUDA:{config['vision']['device']}  "
+                f"cap@{float(config['vision']['cap']['confidence']):.2f}="
+                f"{len(visual.caps)}  "
+                f"corners={len(visual.display_corners)}  "
+                + ("rack=OK" if visual.pose is not None else "rack=not found")
+            )
+            cv2.putText(
+                preview,
+                status[:150],
+                (10, 24),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.52,
+                (0, 220, 0) if visual.pose is not None else (0, 80, 255),
+                1,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                preview,
+                "S/SPACE/ENTER: stable scan   Q/ESC: quit",
+                (10, max(45, preview.shape[0] - 12)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.48,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+            cv2.imshow(window, preview)
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord("q"), 27):
+                break
+            if key in (ord("s"), ord(" "), 10, 13):
+                cv2.putText(
+                    preview,
+                    "Capturing stable scan...",
+                    (10, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (0, 255, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+                cv2.imshow(window, preview)
+                cv2.waitKey(1)
+                observation = runtime.workflow.scan(rack_id)
+                scan_count += 1
+                print(f"\n稳定扫描 #{scan_count}：")
+                print(format_observation(observation))
+                _save_scan_if_available(runtime, config)
+            try:
+                if cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1:
+                    break
+            except cv2.error:
+                break
+    finally:
+        try:
+            cv2.destroyWindow(window)
+        except cv2.error:
+            pass
+    print(f"实时扫描已退出；本次完成 {scan_count} 次稳定扫描。")
+    return 0
+
+
+def _draw_live_scan_overlay(
+    image: np.ndarray,
+    visual: RackVisualDetection,
+) -> None:
+    # The live/demo view intentionally exposes only the calibrated K0-K3 layer,
+    # never the underlying screw boxes or centers.
+    if len(visual.display_corners) == 4:
+        corners = np.asarray(
+            [
+                [int(round(point.u)), int(round(point.v))]
+                for point in visual.display_corners
+            ],
+            dtype=np.int32,
+        )
+        cv2.polylines(image, [corners], True, (255, 0, 255), 1, cv2.LINE_AA)
+        for index, point in enumerate(visual.display_corners):
+            center = (int(round(point.u)), int(round(point.v)))
+            color = (0, 255, 255) if index == 0 else (255, 255, 0)
+            cv2.circle(image, center, 5 if index == 0 else 3, color, 1, cv2.LINE_AA)
+            cv2.putText(
+                image,
+                f"K{index}",
+                (center[0] + 4, center[1] - 4),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.38,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+
+    for address, point in visual.projected_slots:
+        center = (int(round(point.u)), int(round(point.v)))
+        cv2.drawMarker(
+            image,
+            center,
+            (255, 120, 0),
+            cv2.MARKER_CROSS,
+            7,
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            image,
+            f"r{address.row}c{address.column}",
+            (center[0] + 4, center[1] - 4),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.34,
+            (255, 120, 0),
+            1,
+            cv2.LINE_AA,
+        )
+
+    for cap in visual.caps:
+        box = cap.box
+        left, top = int(round(box.x1)), int(round(box.y1))
+        right, bottom = int(round(box.x2)), int(round(box.y2))
+        center = (int(round(box.center.u)), int(round(box.center.v)))
+        cv2.rectangle(image, (left, top), (right, bottom), (0, 220, 0), 1)
+        cv2.circle(image, center, 2, (0, 0, 255), -1, cv2.LINE_AA)
+        cv2.putText(
+            image,
+            f"{cap.confidence:.2f}",
+            (left, max(12, top - 4)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.40,
+            (0, 220, 0),
+            1,
+            cv2.LINE_AA,
+        )
+
+
+def _transfer_display_process(
+    window: str,
+    frames: object,
+    ready: object,
+    errors: object,
+) -> None:
+    """Own all Qt/OpenCV GUI calls in a dedicated process main thread."""
+    frame_queue = frames
+    ready_event = ready
+    error_queue = errors
+    window_created = False
+    try:
+        cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+        window_created = True
+        ready_event.set()
+        while True:
+            encoded = frame_queue.get()
+            if encoded is None:
+                break
+            image = cv2.imdecode(
+                np.frombuffer(encoded, dtype=np.uint8),
+                cv2.IMREAD_COLOR,
+            )
+            if image is None:
+                continue
+            cv2.imshow(window, image)
+            cv2.waitKey(1)
+            if cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1:
+                raise RuntimeError("录像窗口被关闭")
+    except BaseException as exc:
+        try:
+            error_queue.put_nowait(str(exc))
+        except Exception:
+            pass
+        ready_event.set()
+    finally:
+        if window_created:
+            try:
+                cv2.destroyWindow(window)
+                cv2.waitKey(1)
+            except cv2.error:
+                pass
+
+
+class _TransferLiveDisplay:
+    """Capture/infer in a thread; render with Qt in a separate process."""
+
+    def __init__(
+        self,
+        observer: CameraRackObserver,
+        rack_id: str,
+        device: str,
+    ) -> None:
+        self._observer = observer
+        self._rack_id = rack_id
+        self._device = device
+        self._window = f"{rack_id} transfer recording | wrist camera"
+        self._state_lock = threading.RLock()
+        self._moving = False
+        self._stop = threading.Event()
+        self._error: BaseException | None = None
+        context = multiprocessing.get_context("spawn")
+        self._frames = context.Queue(maxsize=2)
+        self._process_ready = context.Event()
+        self._process_errors = context.Queue(maxsize=1)
+        self._process = context.Process(
+            target=_transfer_display_process,
+            args=(
+                self._window,
+                self._frames,
+                self._process_ready,
+                self._process_errors,
+            ),
+            name="transfer-display-window",
+            daemon=True,
+        )
+        self._thread = threading.Thread(
+            target=self._capture_loop,
+            name="transfer-display-capture",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self._process.start()
+        if not self._process_ready.wait(timeout=30.0):
+            self._stop.set()
+            raise VisionError("录像显示进程启动超时")
+        process_error = self._read_process_error()
+        if process_error:
+            raise VisionError(f"录像窗口启动失败：{process_error}")
+        if not self._process.is_alive():
+            raise VisionError("录像显示进程意外退出")
+        self._thread.start()
+
+    def set_moving(self, moving: bool) -> None:
+        # Holding this lock through stationary inference guarantees a motion
+        # command waits for the current YOLO call to finish. Once moving=True,
+        # no new inference can start until the reached-pose check completes.
+        with self._state_lock:
+            process_error = self._read_process_error()
+            if process_error:
+                raise VisionError(f"录像窗口已停止：{process_error}")
+            if self._error is not None:
+                raise VisionError(f"录像窗口已停止：{self._error}")
+            if not self._process.is_alive():
+                raise VisionError("录像显示进程已退出")
+            self._moving = bool(moving)
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=30.0)
+        self._clear_frame_queue()
+        try:
+            self._frames.put_nowait(None)
+        except queue.Full:
+            pass
+        if self._process.is_alive():
+            self._process.join(timeout=10.0)
+        if self._process.is_alive():
+            self._process.terminate()
+            self._process.join(timeout=5.0)
+        self._frames.close()
+        self._process_errors.close()
+
+    def _capture_loop(self) -> None:
+        try:
+            while not self._stop.is_set():
+                if not self._process.is_alive():
+                    detail = self._read_process_error() or "显示进程意外退出"
+                    raise VisionError(detail)
+                with self._state_lock:
+                    moving = self._moving
+                    if not moving:
+                        frame, visual = self._observer.capture_transfer_display(
+                            self._rack_id,
+                            infer=True,
+                        )
+                    else:
+                        frame = None
+                        visual = None
+                if moving:
+                    frame, _ = self._observer.capture_transfer_display(
+                        self._rack_id,
+                        infer=False,
+                    )
+
+                if frame is None:
+                    continue
+                preview = np.asarray(frame.color).copy()
+                if visual is not None:
+                    _draw_live_scan_overlay(preview, visual)
+                    status = (
+                        f"CUDA:{self._device} LIVE | corners="
+                        f"{len(visual.display_corners)} slots="
+                        f"{len(visual.projected_slots)} caps={len(visual.caps)}"
+                    )
+                    color = (0, 220, 0)
+                else:
+                    status = "ARM MOVING | YOLO PAUSED | RAW WRIST VIEW"
+                    color = (0, 165, 255)
+                cv2.putText(
+                    preview,
+                    status,
+                    (10, 24),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.52,
+                    color,
+                    1,
+                    cv2.LINE_AA,
+                )
+                success, encoded = cv2.imencode(
+                    ".jpg",
+                    preview,
+                    (cv2.IMWRITE_JPEG_QUALITY, 90),
+                )
+                if not success:
+                    raise VisionError("录像画面 JPEG 编码失败")
+                self._send_latest(encoded.tobytes())
+        except BaseException as exc:
+            self._error = exc
+
+    def _send_latest(self, encoded: bytes) -> None:
+        try:
+            self._frames.put_nowait(encoded)
+            return
+        except queue.Full:
+            pass
+        try:
+            self._frames.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            self._frames.put_nowait(encoded)
+        except queue.Full:
+            pass
+
+    def _clear_frame_queue(self) -> None:
+        while True:
+            try:
+                self._frames.get_nowait()
+            except queue.Empty:
+                return
+
+    def _read_process_error(self) -> str:
+        try:
+            return str(self._process_errors.get_nowait())
+        except queue.Empty:
+            return ""
 
 
 def _plan_transfer(
@@ -835,6 +1403,7 @@ def _transfer(
     command: TransferCommand,
 ) -> int:
     _require_local_transfer(command)
+    live_display: _TransferLiveDisplay | None = None
     if (
         runtime.mode == "real"
         and not project_path(
@@ -850,9 +1419,23 @@ def _transfer(
         # the program move to the taught global observation pose itself.
         runtime.start(
             need_arm=True,
-            need_camera=False,
+            need_camera=runtime.mode == "real",
             need_gripper=True,
         )
+        if runtime.mode == "real":
+            if not isinstance(runtime.observer, CameraRackObserver):
+                raise VisionError("真机 transfer 缺少相机观察器")
+            live_display = _TransferLiveDisplay(
+                runtime.observer,
+                command.source.rack_id,
+                str(config["vision"]["device"]),
+            )
+            live_display.start()
+            runtime.workflow.set_motion_state_changed(live_display.set_moving)
+        if runtime.mode == "real" and bool(
+            config["motion"].get("confirm_each_step", False)
+        ):
+            runtime.workflow.set_step_confirmation(_confirm_transfer_step)
         runtime.require_motion_ready()
         if runtime.mode == "real" and bool(
             config["runtime"]["require_enter_before_motion"]
@@ -864,16 +1447,18 @@ def _transfer(
             )
             try:
                 empty_confirmation = input(
-                    "输入 EMPTY 并回车，允许移动到观察位："
-                ).strip()
+                    "直接按 Enter 允许移动到观察位，输入 q 取消："
+                ).strip().lower()
             except EOFError as error:
                 raise WorkflowError(
                     "observation-pose authorization input is unavailable"
                 ) from error
-            if empty_confirmation != "EMPTY":
+            if empty_confirmation in {"q", "quit", "stop"}:
                 raise WorkflowError(
-                    "operator did not confirm an empty tool for observation motion"
+                    "operator cancelled observation-pose motion"
                 )
+            if empty_confirmation:
+                raise WorkflowError("观察位确认只接受空回车")
         runtime.move_to_observation_pose()
         runtime.start(
             need_arm=True,
@@ -895,13 +1480,17 @@ def _transfer(
                 "确认首轮观测和预览航点正确，急停可触达。"
             )
             try:
-                authorization = input("输入 MOVE 并回车开始：").strip()
+                authorization = input(
+                    "直接按 Enter 开始执行，输入 q 取消："
+                ).strip().lower()
             except EOFError as error:
                 raise WorkflowError(
                     "motion authorization input is unavailable"
                 ) from error
-            if authorization != "MOVE":
-                raise WorkflowError("operator did not authorize motion")
+            if authorization in {"q", "quit", "stop"}:
+                raise WorkflowError("operator cancelled transfer motion")
+            if authorization:
+                raise WorkflowError("执行确认只接受空回车")
 
         runtime.require_motion_ready()
         runtime.require_observation_pose()
@@ -929,7 +1518,24 @@ def _transfer(
             )
         raise
     finally:
+        runtime.workflow.set_motion_state_changed(None)
+        if live_display is not None:
+            live_display.stop()
         runtime.close()
+
+
+def _confirm_transfer_step(description: str) -> None:
+    print(f"\n下一步：{description}")
+    try:
+        answer = input(
+            "检查路径和现场；直接按 Enter 继续，输入 q 后回车取消："
+        ).strip().lower()
+    except EOFError as error:
+        raise WorkflowError("逐步确认输入不可用，已停止") from error
+    if answer in {"q", "quit", "stop"}:
+        raise WorkflowError("操作员取消了逐步执行")
+    if answer:
+        raise WorkflowError("逐步确认只接受空回车；已停止")
 
 
 def _require_local_transfer(command: TransferCommand) -> None:
@@ -963,28 +1569,22 @@ def _module_exists(module: str) -> bool:
         return False
 
 
-def _validate_model_contracts(cap_path: object, pose_path: object) -> None:
+def _validate_model_contracts(cap_path: object, screw_path: object) -> None:
     """Load weight metadata only; inference remains a separate CUDA check."""
     from ultralytics import YOLO
 
     cap = YOLO(str(cap_path), task="detect")
     cap_names = {int(key): str(value) for key, value in dict(cap.names).items()}
-    if cap_names != {0: "tube_cap"}:
-        raise ConfigError(f"cap classes are {cap_names}, expected {{0: 'tube_cap'}}")
+    if cap_names != {0: "item"}:
+        raise ConfigError(f"cap classes are {cap_names}, expected {{0: 'item'}}")
 
-    pose = YOLO(str(pose_path), task="pose")
-    pose_names = {
-        int(key): str(value) for key, value in dict(pose.names).items()
+    screw = YOLO(str(screw_path), task="detect")
+    screw_names = {
+        int(key): str(value) for key, value in dict(screw.names).items()
     }
-    if pose_names != {0: "rack_surface"}:
+    if screw_names != {0: "item"}:
         raise ConfigError(
-            f"rack pose classes are {pose_names}, "
-            "expected {0: 'rack_surface'}"
-        )
-    keypoint_shape = tuple(getattr(pose.model, "kpt_shape", ()))
-    if keypoint_shape != (8, 3):
-        raise ConfigError(
-            f"rack pose keypoint shape is {keypoint_shape}, expected (8, 3)"
+            f"screw classes are {screw_names}, expected {{0: 'item'}}"
         )
 
 
