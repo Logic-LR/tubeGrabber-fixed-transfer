@@ -111,6 +111,14 @@ Windows 激活虚拟环境时使用：
 .venv\Scripts\Activate.ps1
 ~~~
 
+机器人本机已经配置了 Conda 环境 <code>tube_vision</code>，在机器人上运行项目时可以直接激活：
+
+~~~bash
+conda activate tube_vision
+~~~
+
+激活后应在项目根目录执行后续安装、检查和运行命令。
+
 ### 2. Fake 模式最小安装
 
 ~~~bash
