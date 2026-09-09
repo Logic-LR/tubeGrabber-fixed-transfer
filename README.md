@@ -2,7 +2,7 @@
 
 基于 Intel RealSense D435、Ultralytics YOLO 和 RealMan 七轴机械臂的 2×6 试管架视觉引导抓放系统。
 
-项目提供从 RGB-D 感知、试管架标定、槽位状态判断、三维定位、运动规划到抓放后复扫验证的完整同架闭环，同时支持不连接任何硬件的 Fake 模式和可选的自然语言命令解析。
+项目提供从 RGB-D 感知、试管架标定、槽位状态判断、三维定位、运动规划到抓放后复扫验证的完整同架闭环，同时支持可选的自然语言命令解析。
 
 > [!CAUTION]
 > 这是会驱动真实机械臂的实验项目，不是安全认证系统。真机运行必须保证急停可触达、底盘锁定、机械臂周围无人且无障碍，并由操作人员低速监护。不要直接复用仓库中的手眼、TCP、观察位或工作空间参数到另一台设备。
@@ -11,7 +11,6 @@
 
 | 项目 | 状态 |
 |---|---|
-| Fake 扫描、规划、抓放闭环 | 已实现 |
 | D435 对齐 RGB-D 采集 | 已实现 |
 | cap / screw 双 YOLO Detection | 已实现，真机固定使用 CUDA:0 |
 | 2×6 槽位标定与占用判断 | 已实现 |
@@ -23,7 +22,7 @@
 | 跨试管架底盘导航 | 未实现，命令会被安全拒绝 |
 | 语音输入与播报 | 未实现 |
 
-项目版本：<code>0.1.0</code>。默认配置为 <code>runtime.mode: fake</code>，克隆后不会连接真实硬件。
+项目版本：<code>0.1.0</code>。
 
 ## 核心能力
 
@@ -119,7 +118,7 @@ conda activate tube_vision
 
 激活后应在项目根目录执行后续安装、检查和运行命令。
 
-### 2. Fake 模式最小安装
+### 2. 安装项目基础依赖
 
 ~~~bash
 python -m pip install -e .
@@ -152,30 +151,6 @@ python -m pip install -e ".[agent]"
 ~~~
 
 也可以使用 <code>python -m pip install -r requirements.txt</code> 一次安装项目声明的全部第三方依赖；PyTorch 和 RealMan SDK 仍需根据部署机单独安装。
-
-## 五分钟 Fake 快速体验
-
-Fake 模式不会初始化 D435、机械臂或夹爪，适合验证命令、规划和状态机。
-
-~~~bash
-# 环境与配置检查
-python -m tube_grabber doctor
-
-# 模拟扫描
-python -m tube_grabber scan --rack rack_1
-
-# 只生成抓放计划
-python -m tube_grabber plan-transfer \
-  --source rack_1.r1c1 \
-  --destination rack_1.r1c2
-
-# 执行完整假硬件闭环
-python -m tube_grabber transfer \
-  --source rack_1.r1c1 \
-  --destination rack_1.r1c2
-~~~
-
-槽位地址格式为 <code>rack_1.r1c1</code>：架号为 <code>rack_1</code> 或 <code>rack_2</code>，行为 1～2，列为 1～6。源槽必须有管、目标槽必须为空，且当前仅允许同一 rack 内搬运。
 
 ## 模型准备
 
@@ -217,7 +192,7 @@ python tools/test_yolo_stream.py
 - <code>config/poses.yaml</code>：固定观察位；
 - <code>config/racks/rack_1.yaml</code>：rack_1 槽位与展示角点标定。
 
-新设备部署时，先保持 <code>runtime.mode: fake</code>，并将以下两个确认锁设为 <code>false</code>：
+新设备部署时，先不要连接或驱动真机，并将以下两个确认锁设为 <code>false</code>：
 
 ~~~yaml
 # config/poses.yaml
@@ -379,7 +354,7 @@ python -m tube_grabber agent-plan \
 
 | 配置路径 | 含义 |
 |---|---|
-| <code>runtime.mode</code> | <code>fake</code> 或 <code>real</code> |
+| <code>runtime.mode</code> | 运行模式；连接真机时使用 <code>real</code> |
 | <code>runtime.require_enter_before_motion</code> | 观察位和抓放前人工确认 |
 | <code>runtime.destination_recheck_while_carrying</code> | 是否在持管目标高位重新扫描 |
 | <code>camera</code> | 序列号、分辨率、帧率、深度范围 |
@@ -413,7 +388,6 @@ python tools/tune_tcp.py --dry-run --delta 0 0 1
 ├── tube_grabber/
 │   ├── agent/
 │   ├── core/
-│   ├── fakes/
 │   ├── hardware/
 │   ├── motion/
 │   ├── vision/
@@ -438,7 +412,6 @@ python -m unittest discover -s tests -v
 - 双圆心标定、2×6 网格和盖子/槽位匹配；
 - TCP/法兰转换、倾斜架面运动规划和工作空间门禁；
 - RealSense、RealMan 与 RM Plus SDK 返回值适配；
-- Fake 扫描、规划、Agent 和完整抓放闭环；
 - 执行前现场变化、异常持管状态和最终复扫失败路径。
 
 单元测试不能证明真机识别精度或运动安全。第一次实机运行必须按 [真机分阶段检查清单](docs/LAB_CHECKLIST.md) 从只读检查逐级推进。
@@ -492,4 +465,4 @@ python -m unittest discover -s tests -v
 
 ---
 
-如果你只是评估项目，请从 Fake 模式开始；如果你要连接真实设备，请先完成整份真机检查清单。
+连接真实设备前，请先完成整份真机检查清单。
