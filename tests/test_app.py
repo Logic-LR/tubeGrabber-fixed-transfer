@@ -158,9 +158,13 @@ class ApplicationIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(result, 2)
 
-    def test_unconfigured_rack_is_rejected_before_scan(self) -> None:
-        result = main(["scan", "--rack", "rack_2"])
-        self.assertEqual(result, 2)
+    def test_default_fake_runtime_can_scan_rack_2(self) -> None:
+        result = main(["scan", "--rack", "rack_2", "--no-display"])
+        self.assertEqual(result, 0)
+
+    def test_mobile_pick_home_plan_accepts_auto_source(self) -> None:
+        result = main(["plan-mobile-pick-home", "--auto-source"])
+        self.assertEqual(result, 0)
 
     def test_agent_transfer_uses_the_existing_transfer_path(self) -> None:
         with patch("tube_grabber.cli._transfer", return_value=0) as transfer:

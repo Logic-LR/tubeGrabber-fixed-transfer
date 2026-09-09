@@ -20,6 +20,7 @@ class FakeRackObserver:
         }
         self._sequences: dict[str, list[RackObservation]] = {}
         self._pending_final: dict[str, RackObservation] = {}
+        self._carried_cap_height_mm: float | None = None
         self.calls: list[str] = []
 
     def observe_rack(self, rack_id: str) -> RackObservation:
@@ -62,6 +63,64 @@ class FakeRackObserver:
             raise ValueError("fake observation sequence rack ids must match")
         self._sequences[rack_id] = list(observations)
         self.observations[rack_id] = observations[-1]
+
+    def record_pick(self, address: SlotAddress) -> None:
+        """Apply a successful physical pick to the fake world."""
+        before = self.observations[address.rack_id]
+        source = before.slot(address)
+        if (
+            source.occupancy is not Occupancy.OCCUPIED
+            or source.cap_top_base is None
+            or source.hole_on_plane_base is None
+        ):
+            raise VisionError("fake pick source is not a complete occupied slot")
+        delta = (
+            source.cap_top_base.x_mm - source.hole_on_plane_base.x_mm,
+            source.cap_top_base.y_mm - source.hole_on_plane_base.y_mm,
+            source.cap_top_base.z_mm - source.hole_on_plane_base.z_mm,
+        )
+        self._carried_cap_height_mm = sum(
+            delta[index] * before.approach_axis_base[index]
+            for index in range(3)
+        )
+        self.observations[address.rack_id] = replace(
+            before,
+            slots=tuple(
+                replace(slot, occupancy=Occupancy.EMPTY, cap_top_base=None)
+                if slot.address == address
+                else slot
+                for slot in before.slots
+            ),
+            timestamp_ms=before.timestamp_ms + 1.0,
+        )
+
+    def record_place(self, address: SlotAddress) -> None:
+        """Apply a successful physical placement to the fake world."""
+        if self._carried_cap_height_mm is None:
+            raise VisionError("fake gripper has no recorded tube to place")
+        before = self.observations[address.rack_id]
+        destination = before.slot(address)
+        if (
+            destination.occupancy is not Occupancy.EMPTY
+            or destination.hole_on_plane_base is None
+        ):
+            raise VisionError("fake placement destination is not an empty slot")
+        cap = _shift_along(
+            destination.hole_on_plane_base,
+            before.approach_axis_base,
+            self._carried_cap_height_mm,
+        )
+        self.observations[address.rack_id] = replace(
+            before,
+            slots=tuple(
+                replace(slot, occupancy=Occupancy.OCCUPIED, cap_top_base=cap)
+                if slot.address == address
+                else slot
+                for slot in before.slots
+            ),
+            timestamp_ms=before.timestamp_ms + 1.0,
+        )
+        self._carried_cap_height_mm = None
 
     def _simulate_pick_and_destination_recheck(
         self,

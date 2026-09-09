@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from importlib import import_module
 import subprocess
+import time
 
 from tube_grabber.core.errors import HardwareError
 from tube_grabber.core.models import Pose6D
@@ -193,6 +194,31 @@ class RealManArm:
                 "机械臂关节存在错误，禁止运动："
                 + ", ".join(f"0x{value:04X}" for value in errors)
             )
+
+    def clear_joint_errors(self) -> tuple[tuple[int, int], ...]:
+        """Clear active joint errors in the current SDK connection."""
+        robot = self.sdk_robot
+        joint = call_sdk("读取关节错误", robot.rm_get_joint_err_flag)
+        if not isinstance(joint, Mapping):
+            raise HardwareError(f"关节错误状态格式错误: {joint!r}")
+        require_success("读取关节错误", joint.get("return_code", -3))
+        flags = joint.get("err_flag", joint.get("err", ()))
+        if not isinstance(flags, Sequence) or isinstance(flags, (str, bytes)):
+            raise HardwareError(f"关节错误标志格式错误: {flags!r}")
+        cleared: list[tuple[int, int]] = []
+        for joint_num, error in enumerate(flags, start=1):
+            error_code = int(error)
+            if not error_code:
+                continue
+            call_and_require(
+                f"清除第 {joint_num} 关节错误 0x{error_code:04X}",
+                robot.rm_set_joint_clear_err,
+                joint_num,
+            )
+            cleared.append((joint_num, error_code))
+        if cleared:
+            time.sleep(1.0)
+        return tuple(cleared)
 
     def move_pose(
         self,

@@ -2,6 +2,6 @@
 # Verify them at low speed before enabling physical manipulation.
 
 observation_pose:
-  position_mm: [145.278, 290.904, 57.145]
-  rpy_rad: [-2.452, 0.087, -1.605]
-  confirmed: false
+  position_mm: [89.888, 284.810, 135.422]
+  rpy_rad: [-2.310, 0.024, -1.554]
+  confirmed: true

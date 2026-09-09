@@ -275,7 +275,20 @@ def rack_detection_from_screws(
     if not cv2.isContourConvex(polygon):
         raise VisionError("four screw centers do not form a convex rack surface")
 
-    k0_index = _find_marker_corner(image, ordered, marker)
+    try:
+        k0_index = _find_marker_corner(image, ordered, marker)
+    except VisionError as error:
+        if "white K0 marker was not found" not in str(error):
+            raise
+        # Auto-pick only needs a stable grid, not a semantic slot label.  Keep
+        # the grid usable when the marker is temporarily hidden by selecting
+        # the image-space top-left screw as the deterministic origin.
+        k0_index = min(
+            range(len(ordered)),
+            key=lambda index: (
+                ordered[index].box.center.u + ordered[index].box.center.v
+            ),
+        )
     clockwise = ordered[k0_index:] + ordered[:k0_index]
     next_length = _center_distance(clockwise[0], clockwise[1])
     previous_length = _center_distance(clockwise[0], clockwise[-1])

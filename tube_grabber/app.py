@@ -432,6 +432,9 @@ def build_runtime(
         reached_check_settle_s=float(
             motion_config.get("reached_check_settle_s", 1.0)
         ),
+        verify_reached_each_waypoint=bool(
+            motion_config.get("verify_reached_each_waypoint", True)
+        ),
         position_reached_tolerance_mm=float(
             motion_config["position_reached_tolerance_mm"]
         ),

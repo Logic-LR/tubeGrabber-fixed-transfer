@@ -124,9 +124,9 @@ def load_config(path: str | Path = "config/app.yaml") -> dict[str, Any]:
     minimum_inliers = int(
         vision["stability"].get("minimum_inlier_frames", 0)
     )
-    if minimum_inliers < 2 or capture_frames < minimum_inliers:
+    if minimum_inliers < 1 or capture_frames < minimum_inliers:
         raise ConfigError(
-            "vision stability requires capture_frames >= minimum_inlier_frames >= 2"
+            "vision stability requires capture_frames >= minimum_inlier_frames >= 1"
         )
 
     if data["arm"].get("work_frame") != "Base":

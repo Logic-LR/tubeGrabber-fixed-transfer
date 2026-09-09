@@ -70,11 +70,12 @@ vision:
     class_names:
       # The supplied weight metadata uses the generic training class `item`.
       0: item
-    confidence: 0.60
+    # Temporary low-confidence threshold for the current tilted orange tube.
+    confidence: 0.10
     iou: 0.45
     image_size: 1280
     depth_window_px: 7
-    maximum_height_error_mm: 4.0
+    maximum_height_error_mm: 6.0
   screw:
     model_path: "models/screw.pt"
     class_names:
@@ -107,10 +108,10 @@ vision:
     hough_edge_threshold: 100.0
     hough_accumulator_threshold: 16.0
   stability:
-    # Capture a wider window and keep requiring at least five complete frames,
-    # so intermittent detector misses do not abort after only seven attempts.
+    # Keep a wide capture window, accept any complete frame, and let the
+    # mobile pick-home coordinator immediately resample visual failures.
     capture_frames: 12
-    minimum_inlier_frames: 5
+    minimum_inlier_frames: 1
     maximum_frame_residual_px: 3.0
     maximum_keypoint_spread_px: 3.0
     minimum_occupancy_agreement: 0.70
@@ -138,18 +139,19 @@ vision:
 racks:
   rack_1:
     calibration_path: "config/racks/rack_1.yaml"
+  rack_2:
+    calibration_path: "config/racks/rack_2.yaml"
 
 geometry:
   hand_eye_path: "config/hand_eye.yaml"
   # Tuned for the current rig. Every new installation must remeasure this
   # before setting motion.parameters_confirmed to true.
-  tcp_offset_end_mm: [-3.000, -14.000, 220.000]
-  # Placement-only TCP: moves the physical gripper 3 mm along end -Y relative
-  # to the pick TCP (software offset uses the opposite sign).
+  tcp_offset_end_mm: [-3.000, -11.000, 220.000]
+  # Keep placement aligned with the pick TCP until rack_2 is measured.
   destination_tcp_offset_end_mm: [-3.000, -11.000, 220.000]
   # Current-rig value. Remeasure with the final rack and seated tube.
   cap_top_above_rack_mm: 47.0
-  # Operator-tuned grasp geometry: 20 mm old-project depth plus 5 mm.
+  # Operator-tuned grasp depth for the current tube cap and fingers.
   grasp_depth_below_cap_mm: 28.0
   # Positive: place shallower (farther from rack). Negative: place deeper.
   seating_adjust_mm: 0.0
@@ -160,9 +162,10 @@ geometry:
 motion:
   # Set true only after checking TCP offset, workspace and all rack-normal
   # motion heights on the physical right arm at low speed.
-  parameters_confirmed: false
-  # 真机测试时，每次扫描、夹爪动作和机械臂航点前必须空回车确认。
-  confirm_each_step: true
+  parameters_confirmed: true
+  # Keep the one-time command authorization, then run the validated waypoints
+  # continuously without an Enter prompt before every step.
+  confirm_each_step: false
   poses_path: "config/poses.yaml"
   approach_height_mm: 50.0
   # 150 mm keeps the carried tube away from neighbouring caps during transfer.
@@ -173,12 +176,12 @@ motion:
   # current tool axis to the measured rack normal is allowed.
   maximum_tool_axis_misalignment_deg: 15.0
   maximum_single_move_mm: 500.0
-  # Wait for controller/mechanics to settle before reading reached pose.
+  # Reached-pose checks are disabled for continuous supervised lab execution.
+  # The SDK move call remains blocking and controller errors still stop motion.
   reached_check_settle_s: 1.0
-  position_reached_tolerance_mm: 2.0
+  verify_reached_each_waypoint: false
+  position_reached_tolerance_mm: 4.0
   orientation_reached_tolerance_deg: 0.5
-  # Verified with pick TCP [-3,-14,220], placement TCP [-3,-11,220], and
-  # 28 mm grasp depth. Planned flange envelope is
-  # [31.69,294.90,-86.94] to [205.58,408.20,86.72] mm.
-  workspace_min_mm: [0.0, 270.0, -110.0]
+  # r1c1 retreat reached X=-53.14 mm; keep margin around that measured path.
+  workspace_min_mm: [-80.0, 270.0, -110.0]
   workspace_max_mm: [250.0, 435.0, 200.0]

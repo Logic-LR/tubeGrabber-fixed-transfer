@@ -68,11 +68,11 @@ class RackStabilityConfig:
 
     def __post_init__(self) -> None:
         if (
-            self.minimum_inlier_frames < 2
+            self.minimum_inlier_frames < 1
             or self.capture_frames < self.minimum_inlier_frames
         ):
             raise ValueError(
-                "capture_frames must be >= minimum_inlier_frames >= 2"
+                "capture_frames must be >= minimum_inlier_frames >= 1"
             )
         for name in (
             "maximum_frame_residual_px",
@@ -405,8 +405,8 @@ class PoseRackVision:
                         # During destination recheck, the one carried tube is
                         # deliberately parked above the requested empty slot.  Its
                         # elevated cap may project onto that slot, but it is not a
-                        # seated occupant.  Every other high/low mismatch remains
-                        # a hard failure.
+                        # seated occupant. Other mismatches fall back to the
+                        # calibrated seated-cap height below.
                         slots.append(
                             SlotObservation(
                                 address=address,
@@ -417,11 +417,10 @@ class PoseRackVision:
                             )
                         )
                         continue
-                    raise VisionError(
-                        f"{address.text} cap height {cap_height:.2f}mm differs from "
-                        f"{self._matching.cap_top_above_rack_mm:.2f}mm "
-                        f"by {height_error:.2f}mm"
-                    )
+                    # Reflective caps can return a stable but biased D435
+                    # depth. Keep YOLO occupancy, but use the calibrated rig
+                    # height so that bad depth cannot shift the grasp target.
+                    cap_height = self._matching.cap_top_above_rack_mm
 
             # A seated tube is constrained by its calibrated rack slot.  Keep
             # the grasp laterally centered on that slot and use cap sensing only

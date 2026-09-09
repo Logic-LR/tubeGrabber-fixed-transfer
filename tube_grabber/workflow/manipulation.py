@@ -214,6 +214,7 @@ class ManipulationWorkflow:
         if self._holding_tube:
             raise WorkflowError("cannot pick while the gripper already holds a tube")
         target = self._pick_target(address, observation)
+        self._confirm("夹爪张开到抓取预开位置")
         self.gripper.open_for_pick()
         self.executor.execute(
             self.planner.plan_approach(
@@ -225,6 +226,7 @@ class ManipulationWorkflow:
         # From the moment a close command is sent, treat the payload as held.
         # If communication fails midway, this conservative state prevents a
         # later command from moving the chassis or starting another pick.
+        self._confirm("夹爪夹紧试管；确认夹指已对准盖子侧壁")
         self._holding_tube = True
         self.gripper.grip()
         self.executor.execute(
@@ -469,6 +471,75 @@ class ManipulationWorkflow:
                     "scan and plan again"
                 )
         return latest
+
+    def verify_rack_unchanged(
+        self,
+        original: RackObservation,
+        latest: RackObservation,
+    ) -> None:
+        """Apply the existing scene-change gates to a stationary rack."""
+        if original.rack_id != latest.rack_id:
+            raise WorkflowError(
+                f"rack changed from {original.rack_id} to {latest.rack_id}"
+            )
+        self._verify_rack_position(original, latest)
+        for original_slot in original.slots:
+            current = latest.slot(original_slot.address)
+            if current.occupancy is not original_slot.occupancy:
+                raise WorkflowError(
+                    f"{current.address.text} changed from "
+                    f"{original_slot.occupancy.value} to "
+                    f"{current.occupancy.value}; scan and plan again"
+                )
+
+    def verify_pick_result(
+        self,
+        before: RackObservation,
+        source: SlotAddress,
+        after: RackObservation,
+    ) -> None:
+        """Prove the source emptied before allowing chassis motion."""
+        if source.rack_id != before.rack_id or after.rack_id != before.rack_id:
+            raise WorkflowError("pick verification rack does not match source")
+        self._verify_rack_position(before, after)
+        for original_slot in before.slots:
+            current = after.slot(original_slot.address)
+            expected = (
+                Occupancy.EMPTY
+                if original_slot.address == source
+                else original_slot.occupancy
+            )
+            if current.occupancy is not expected:
+                raise WorkflowError(
+                    f"pick verification failed: {current.address.text} is "
+                    f"{current.occupancy.value}, expected {expected.value}"
+                )
+
+    def verify_place_result(
+        self,
+        before: RackObservation,
+        destination: SlotAddress,
+        after: RackObservation,
+    ) -> None:
+        """Prove the target filled and every other destination slot stayed stable."""
+        if (
+            destination.rack_id != before.rack_id
+            or after.rack_id != before.rack_id
+        ):
+            raise WorkflowError("place verification rack does not match destination")
+        self._verify_rack_position(before, after)
+        for original_slot in before.slots:
+            current = after.slot(original_slot.address)
+            expected = (
+                Occupancy.OCCUPIED
+                if original_slot.address == destination
+                else original_slot.occupancy
+            )
+            if current.occupancy is not expected:
+                raise WorkflowError(
+                    f"place verification failed: {current.address.text} is "
+                    f"{current.occupancy.value}, expected {expected.value}"
+                )
 
     def _recheck_destination_while_carrying(
         self,

@@ -23,8 +23,8 @@ from tube_grabber.core.errors import (
     VisionError,
     WorkflowError,
 )
-from tube_grabber.core.models import Pixel, TransferCommand
-from tube_grabber.core.parsing import parse_transfer
+from tube_grabber.core.models import Pixel, SlotAddress, TransferCommand
+from tube_grabber.core.parsing import parse_slot, parse_transfer
 from tube_grabber.diagnostics import (
     format_observation,
     format_prepared_transfer,
@@ -35,6 +35,14 @@ from tube_grabber.fixed_transfer import (
     build_fixed_transfer_runtime,
     format_fixed_transfer_program,
     load_fixed_transfer_program,
+)
+from tube_grabber.mobile_transfer import (
+    MobileTransferCoordinator,
+    build_mobile_chassis,
+    format_mobile_pick_home_program,
+    format_mobile_transfer_program,
+    load_mobile_pick_home_program,
+    load_mobile_transfer_program,
 )
 from tube_grabber.vision.geometry import validate_transform
 from tube_grabber.vision.rack_calibration import (
@@ -54,6 +62,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         config = load_config(args.config)
+        if args.real:
+            config["runtime"]["mode"] = "real"
         if args.command == "doctor":
             return _doctor(config)
 
@@ -63,6 +73,39 @@ def main(argv: Sequence[str] | None = None) -> int:
                 fixed_config=args.fixed_config,
                 execute=args.command == "fixed-transfer",
             )
+
+        if args.command in ("plan-mobile-transfer", "mobile-transfer"):
+            command = parse_transfer(args.source, args.destination)
+            _require_configured_transfer(config, command)
+            program = load_mobile_transfer_program(
+                project_path(args.mobile_config)
+            )
+            program.require_command(command)
+            print(format_mobile_transfer_program(program))
+            if args.command == "plan-mobile-transfer":
+                print("跨站流程配置校验：通过（未连接任何硬件）")
+                return 0
+            runtime = build_runtime(config)
+            return _mobile_transfer(runtime, config, program, command)
+
+        if args.command in ("plan-mobile-pick-home", "mobile-pick-home"):
+            program = load_mobile_pick_home_program(
+                project_path(args.mobile_config)
+            )
+            source = parse_slot(args.source) if args.source else None
+            if source is not None:
+                _require_configured_rack(config, source.rack_id)
+                program.require_source(source)
+            else:
+                _require_configured_rack(config, program.source_rack)
+            print(format_mobile_pick_home_program(program))
+            if source is None:
+                print("源槽：运行时自动选择唯一识别到的试管")
+            if args.command == "plan-mobile-pick-home":
+                print("抓取回 home 配置校验：通过（未连接任何硬件）")
+                return 0
+            runtime = build_runtime(config)
+            return _mobile_pick_home(runtime, config, program, source)
 
         runtime = build_runtime(
             config,
@@ -122,6 +165,11 @@ def _parser() -> argparse.ArgumentParser:
         default="config/app.yaml",
         help="配置文件路径（默认 config/app.yaml）",
     )
+    parser.add_argument(
+        "--real",
+        action="store_true",
+        help="显式使用真机适配器；仍受全部确认锁和现场口令约束",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser(
         "doctor",
@@ -152,6 +200,44 @@ def _parser() -> argparse.ArgumentParser:
             "--fixed-config",
             default="config/fixed_transfer.yaml",
             help="固定取放点位文件（默认 config/fixed_transfer.yaml）",
+        )
+
+    mobile_plan = subparsers.add_parser(
+        "plan-mobile-transfer",
+        help="校验双试管架视觉闭环与底盘移动配置，不连接硬件",
+    )
+    mobile_execute = subparsers.add_parser(
+        "mobile-transfer",
+        help="执行 rack_1 到 rack_2 的视觉闭环跨站抓放",
+    )
+    for mobile in (mobile_plan, mobile_execute):
+        _add_transfer_arguments(mobile)
+        mobile.add_argument(
+            "--mobile-config",
+            default="config/mobile_transfer.yaml",
+            help="跨站配置文件（默认 config/mobile_transfer.yaml）",
+        )
+
+    pick_home_plan = subparsers.add_parser(
+        "plan-mobile-pick-home",
+        help="校验 rack_1 抓取并带管返回 home 的独立阶段",
+    )
+    pick_home_execute = subparsers.add_parser(
+        "mobile-pick-home",
+        help="执行 rack_1 抓取并带管返回 home；不移动底盘、不释放",
+    )
+    for pick_home in (pick_home_plan, pick_home_execute):
+        source_group = pick_home.add_mutually_exclusive_group(required=True)
+        source_group.add_argument("--source", help="例如 rack_1.r1c1")
+        source_group.add_argument(
+            "--auto-source",
+            action="store_true",
+            help="稳定扫描后自动选择唯一占用的槽位",
+        )
+        pick_home.add_argument(
+            "--mobile-config",
+            default="config/mobile_transfer.yaml",
+            help="跨站配置文件（默认 config/mobile_transfer.yaml）",
         )
 
     scan = subparsers.add_parser("scan", help="识别一个固定站的 2x6 试管架")
@@ -271,6 +357,145 @@ def _fixed_transfer(
         print("固定取放：完成，机械臂已返回 home")
         return 0
     finally:
+        runtime.close()
+
+
+def _mobile_transfer(
+    runtime: TubeGrabberRuntime,
+    config: dict[str, Any],
+    program: Any,
+    command: TransferCommand,
+) -> int:
+    chassis = build_mobile_chassis(runtime.mode, program)
+    if runtime.mode == "real":
+        program.require_real_confirmation()
+        if bool(config["runtime"].get("require_enter_before_motion", True)):
+            try:
+                answer = input(
+                    "确认机械臂空载、底盘路径清空、急停可触达；"
+                    "输入 MOBILE-RUN 执行双架搬运："
+                ).strip()
+            except EOFError as error:
+                raise WorkflowError("mobile authorization input is unavailable") from error
+            if answer != "MOBILE-RUN":
+                raise WorkflowError("operator did not authorize mobile transfer")
+
+    runtime.start(
+        need_arm=True,
+        need_camera=runtime.mode == "real",
+        need_gripper=True,
+    )
+    try:
+        runtime.require_motion_ready()
+        if runtime.mode == "real" and bool(
+            config["motion"].get("confirm_each_step", False)
+        ):
+            runtime.workflow.set_step_confirmation(_confirm_transfer_step)
+        runtime.move_to_observation_pose()
+        coordinator = MobileTransferCoordinator(
+            runtime=runtime,
+            chassis=chassis,
+            program=program,
+            before_chassis=(
+                _confirm_transfer_step
+                if runtime.mode == "real"
+                and bool(config["motion"].get("confirm_each_step", False))
+                else None
+            ),
+        )
+        final = coordinator.execute(command)
+        print("目标架最终闭环复扫：")
+        print(format_observation(final))
+        _save_scan_if_available(runtime, config)
+        print(
+            f"跨站搬运完成：{command.source.text} -> "
+            f"{command.destination.text}；机械臂已回 loaded observation/home"
+        )
+        return 0
+    except BaseException:
+        _stop_quietly(runtime)
+        try:
+            chassis.stop()
+        except Exception:
+            pass
+        if runtime.workflow.holding_tube:
+            print(
+                "警告：任务中断且软件状态仍为持管；禁止继续移动底盘或松爪。",
+                file=sys.stderr,
+            )
+        raise
+    finally:
+        runtime.workflow.set_step_confirmation(None)
+        runtime.close()
+
+
+def _mobile_pick_home(
+    runtime: TubeGrabberRuntime,
+    config: dict[str, Any],
+    program: Any,
+    source: SlotAddress | None,
+) -> int:
+    if runtime.mode == "real":
+        program.require_real_confirmation()
+        if bool(config["runtime"].get("require_enter_before_motion", True)):
+            try:
+                answer = input(
+                    "确认右臂位于空载 home、源试管架正确、机械臂路径无人无障碍、"
+                    "急停可触达；输入 PICK-HOME 执行抓取并带管回 home："
+                ).strip()
+            except EOFError as error:
+                raise WorkflowError("pick-home authorization input is unavailable") from error
+            if answer != "PICK-HOME":
+                raise WorkflowError("operator did not authorize mobile pick-home")
+
+    runtime.start(
+        need_arm=True,
+        need_camera=runtime.mode == "real",
+        need_gripper=True,
+    )
+    try:
+        if runtime.mode == "real":
+            cleared = runtime.arm.clear_joint_errors()  # type: ignore[attr-defined]
+            for joint_num, error_code in cleared:
+                print(f"已清除第 {joint_num} 关节错误 0x{error_code:04X}")
+        runtime.require_motion_ready()
+        if runtime.mode == "real" and bool(
+            config["motion"].get("confirm_each_step", False)
+        ):
+            runtime.workflow.set_step_confirmation(_confirm_transfer_step)
+        runtime.move_to_observation_pose()
+        coordinator = MobileTransferCoordinator(
+            runtime=runtime,
+            chassis=None,
+            program=program,
+            retry_visual_failures=runtime.mode == "real" and source is None,
+        )
+        if source is None:
+            source, final = coordinator.pick_detected_to_home(
+                on_source_selected=lambda selected: print(
+                    f"自动选择源槽：{selected.text}"
+                )
+            )
+        else:
+            final = coordinator.pick_to_home(source)
+        print("源架抓取后闭环复扫：")
+        print(format_observation(final))
+        _save_scan_if_available(runtime, config)
+        print(
+            f"抓取回 home 完成：{source.text} 已确认空；"
+            "机械臂位于 loaded observation/home，夹爪保持夹紧。"
+        )
+        return 0
+    except BaseException:
+        _stop_quietly(runtime)
+        if runtime.workflow.holding_tube:
+            print(
+                "警告：任务中断且软件状态仍为持管；禁止移动底盘或松爪。",
+                file=sys.stderr,
+            )
+        raise
+    finally:
+        runtime.workflow.set_step_confirmation(None)
         runtime.close()
 
 

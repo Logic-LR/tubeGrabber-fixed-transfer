@@ -18,7 +18,7 @@
 | 同一试管架内抓放与最终复扫 | 已实现 |
 | 本地 / Gemini 文本命令解析 | 已实现 |
 | 单个 rack_1 现场标定 | 已包含；默认配置不要求第二个试管架 |
-| 跨试管架底盘导航 | 未实现，命令会被安全拒绝 |
+| 双试管架固定路线搬运 | 已实现独立入口，真机参数默认未确认 |
 | 语音输入与播报 | 未实现 |
 
 项目版本：<code>0.1.0</code>。
@@ -69,7 +69,8 @@ r1c1 / r2c6 双圆心标定 ─→ 2×6 网格 ─→ 槽位占用匹配
 | <code>agent</code> | 本地或 Gemini 文本命令解析 |
 | <code>app / cli</code> | 依赖组装、生命周期、人工确认和命令入口 |
 
-更详细的设计见 [架构说明](docs/ARCHITECTURE.md)。
+更详细的设计见 [架构说明](docs/ARCHITECTURE.md)。2026-09-09 的真机抓取参数、
+闭环结果和续接事项见 [实验日志](docs/LAB_LOG_2026-09-09.md)。
 
 ## 硬件与软件要求
 
@@ -321,6 +322,8 @@ python -m tube_grabber transfer \
 | <code>agent-transfer</code> | 解析文本并走完整抓放流程 | 是 |
 | <code>plan-fixed-transfer</code> | 校验固定取管到篮子的完整路径，不加载视觉 | 否 |
 | <code>fixed-transfer</code> | 执行已确认的固定取管到篮子循环 | 是 |
+| <code>plan-mobile-transfer</code> | 校验双架视觉闭环和底盘路线配置 | 否 |
+| <code>mobile-transfer</code> | 执行 rack_1 到 rack_2 的跨站视觉闭环 | 是 |
 
 查看全部参数：
 
@@ -344,6 +347,23 @@ python -m tube_grabber fixed-transfer
 <code>confirmed: false</code>，因此不能直接驱动真机。必须先在当前机械臂与当前
 <code>Arm_Tip</code> 工具坐标系下示教五个位姿，完成低速验收后再解除确认锁。完整步骤见
 [固定取管到篮子](docs/FIXED_TRANSFER.md)。
+
+## 双试管架移动
+
+同架任务继续使用 `transfer`。固定布置下的 `rack_1 -> rack_2` 任务使用：
+
+~~~bash
+python -m tube_grabber plan-mobile-transfer \
+  --source rack_1.r1c1 --destination rack_2.r1c2
+python -m tube_grabber mobile-transfer \
+  --source rack_1.r1c1 --destination rack_2.r1c2
+python -m tube_grabber mobile-pick-home --auto-source
+~~~
+
+该流程抓取后先回带管 home，确认源槽为空，再让 Woosh 底盘闭环旋转 180 度并
+沿车体 X 平移实测距离。到达后重新识别 `rack_2`，不复用移动前的三维坐标；释放后
+再次复扫目标架。默认配置缺少距离 X、`rack_2` 标定且确认锁关闭，因此不能直接驱动
+真机。完整配置和验收步骤见 [双试管架移动闭环](docs/MOBILE_TRANSFER.md)。
 
 ## Agent 命令
 
@@ -458,9 +478,10 @@ python -m unittest discover -s tests -v
 
 确认控制器处于真实模式且已上电、七轴和 Base/Arm_Tip 坐标系正确、RM Plus 使用 9600 波特率和工具端 24 V，并停止 <code>atom</code>、<code>zhixing_ctrl.py</code> 等冲突进程。
 
-### 跨架任务被拒绝
+### 普通 transfer 的跨架任务被拒绝
 
-这是预期行为。当前没有底盘导航和带管跨站状态机，只支持同一 rack 内搬运。
+这是预期行为。`transfer` 只支持同架；经过独立配置和验收的固定双架路线必须使用
+`mobile-transfer`。
 
 ## GitHub 发布前检查
 
@@ -478,6 +499,7 @@ python -m unittest discover -s tests -v
 - [模型契约](docs/MODEL_CONTRACT.md)
 - [Agent 接入说明](docs/AGENT.md)
 - [真机分阶段检查清单](docs/LAB_CHECKLIST.md)
+- [双试管架移动闭环](docs/MOBILE_TRANSFER.md)
 
 ---
 

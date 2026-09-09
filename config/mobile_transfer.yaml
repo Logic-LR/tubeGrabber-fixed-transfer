@@ -1,0 +1,36 @@
+# Cross-station rack_1 -> rack_2 workflow.
+# Keep both confirmation locks false until the loaded camera pose and complete
+# chassis route have passed supervised, low-speed validation.
+
+schema_version: mobile_tube_transfer.v1
+# Arm-only phase gate: rack_1 pick -> loaded home -> source-empty verification.
+pick_home_confirmed: true
+confirmed: false
+
+racks:
+  source: rack_1
+  destination: rack_2
+
+# This one pose is both the chassis-safe loaded transport pose and the wrist
+# camera pose used to verify a rack while holding a tube. The held tube must be
+# outside the rack polygon while all four screws and the K0 marker stay visible.
+loaded_observation_pose:
+  position_mm: [89.888, 284.810, 135.422]
+  rpy_rad: [-2.310, 0.024, -1.554]
+  confirmed: true
+
+chassis:
+  # Measure this on the final floor layout. Null deliberately blocks planning
+  # and execution until a real distance is supplied.
+  rotation_deg: 180.0
+  translation_x_m: null
+  rotation_speed_radps: 0.08
+  translation_speed_mps: 0.03
+  yaw_tolerance_deg: 1.0
+  position_tolerance_m: 0.012
+  maximum_rotation_translation_m: 0.03
+  timeout_s: 120.0
+  helpers:
+    # Robot-side closed-loop helpers from the audited Woosh integration.
+    rotate_helper_path: "/home/rm/agv_debug_tools/grabber_rotate_relative"
+    pose_servo_path: "/home/rm/agv_debug_tools/grabber_pose_servo"

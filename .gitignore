@@ -17,6 +17,8 @@ dist/
 .DS_Store
 artifacts/*
 !artifacts/.gitkeep
+!artifacts/2026-09-09/
+!artifacts/2026-09-09/**
 models/*.pt
 !models/.gitkeep
 training/tube_slots.yaml

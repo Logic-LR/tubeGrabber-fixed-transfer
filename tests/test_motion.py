@@ -309,6 +309,47 @@ class MotionExecutorTests(unittest.TestCase):
 
         self.assertEqual(arm.stop_count, 1)
 
+    def test_can_run_continuously_without_reached_pose_checks(self) -> None:
+        class InaccurateArm(FakeArm):
+            def move_pose(
+                self,
+                pose: Pose6D,
+                speed_percent: int,
+                *,
+                linear: bool = False,
+            ) -> None:
+                super().move_pose(pose, speed_percent, linear=linear)
+                self.pose = Pose6D(
+                    pose.x_mm + 3.0,
+                    pose.y_mm,
+                    pose.z_mm,
+                    pose.rx_rad,
+                    pose.ry_rad,
+                    pose.rz_rad,
+                    pose.frame,
+                )
+
+        arm = InaccurateArm(Pose6D(0, 0, 0, 0, 0, 0))
+        arm.connect()
+        executor = MotionExecutor(
+            arm,
+            workspace_min_mm=(-100, -100, -100),
+            workspace_max_mm=(200, 200, 200),
+            maximum_single_move_mm=200,
+            verify_reached_each_waypoint=False,
+            position_reached_tolerance_mm=1.0,
+            orientation_reached_tolerance_deg=0.5,
+        )
+
+        executor.execute(
+            MotionPlan(
+                (Waypoint("missed", Pose6D(10, 0, 0, 0, 0, 0), 5, True),)
+            )
+        )
+
+        self.assertEqual(len(arm.moves), 1)
+        self.assertEqual(arm.stop_count, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

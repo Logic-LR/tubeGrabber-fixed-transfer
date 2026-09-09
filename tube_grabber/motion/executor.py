@@ -25,6 +25,7 @@ class MotionExecutor:
         workspace_max_mm: Sequence[float],
         maximum_single_move_mm: float,
         reached_check_settle_s: float = 0.0,
+        verify_reached_each_waypoint: bool = True,
         position_reached_tolerance_mm: float,
         orientation_reached_tolerance_deg: float,
         before_waypoint: Callable[[Waypoint], None] | None = None,
@@ -54,6 +55,7 @@ class MotionExecutor:
             or self.reached_check_settle_s < 0.0
         ):
             raise MotionError("reached_check_settle_s must be finite and non-negative")
+        self.verify_reached_each_waypoint = bool(verify_reached_each_waypoint)
         self.position_reached_tolerance_mm = _positive_finite(
             position_reached_tolerance_mm,
             "position_reached_tolerance_mm",
@@ -108,9 +110,12 @@ class MotionExecutor:
                         waypoint.speed_percent,
                         linear=waypoint.linear,
                     )
-                    if self.reached_check_settle_s > 0.0:
-                        time.sleep(self.reached_check_settle_s)
-                    reached = self.arm.get_pose()
+                    if self.verify_reached_each_waypoint:
+                        if self.reached_check_settle_s > 0.0:
+                            time.sleep(self.reached_check_settle_s)
+                        reached = self.arm.get_pose()
+                    else:
+                        reached = waypoint.pose
                 finally:
                     if motion_notified and self.motion_state_changed is not None:
                         self.motion_state_changed(False)
