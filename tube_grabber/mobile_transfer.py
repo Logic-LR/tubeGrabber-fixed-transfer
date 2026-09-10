@@ -34,6 +34,7 @@ class MobilePickHomeProgram:
     source_rack: str
     loaded_observation_pose: Pose6D
     loaded_observation_confirmed: bool
+    verify_pick_after_home: bool = True
 
     def __post_init__(self) -> None:
         if self.source_rack != "rack_1":
@@ -60,6 +61,30 @@ class MobilePickHomeProgram:
 
 
 @dataclass(frozen=True)
+class MobileTransferRequest:
+    """A mobile transfer request with an optional post-move target selector."""
+
+    source: SlotAddress | None = None
+    destination: SlotAddress | None = None
+    auto_source: bool = False
+    auto_destination: bool = False
+
+    def __post_init__(self) -> None:
+        if self.source is None and not self.auto_source:
+            raise ValueError("mobile transfer requires a source or auto_source")
+        if self.source is not None and self.auto_source:
+            raise ValueError("source and auto_source are mutually exclusive")
+        if self.destination is None and not self.auto_destination:
+            raise ValueError(
+                "mobile transfer requires a destination or auto_destination"
+            )
+        if self.destination is not None and self.auto_destination:
+            raise ValueError(
+                "destination and auto_destination are mutually exclusive"
+            )
+
+
+@dataclass(frozen=True)
 class MobileTransferProgram:
     confirmed: bool
     source_rack: str
@@ -69,6 +94,8 @@ class MobileTransferProgram:
     chassis_move: ChassisMove
     rotate_helper_path: str
     pose_servo_path: str
+    verify_pick_after_home: bool = True
+    return_to_start_after_transfer: bool = True
 
     def __post_init__(self) -> None:
         if self.source_rack == self.destination_rack:
@@ -87,6 +114,16 @@ class MobileTransferProgram:
                 f"mobile destination must be {self.destination_rack}, got "
                 f"{command.destination.rack_id}"
             )
+
+    def require_request(self, request: MobileTransferRequest) -> None:
+        if request.source is not None:
+            self.require_source(request.source)
+        if request.destination is not None:
+            if request.destination.rack_id != self.destination_rack:
+                raise WorkflowError(
+                    f"mobile destination must be {self.destination_rack}, got "
+                    f"{request.destination.rack_id}"
+                )
 
     def require_source(self, source: SlotAddress) -> None:
         rack_id = source.rack_id
@@ -123,13 +160,49 @@ class MobileTransferCoordinator:
         self.program = program
         self.before_chassis = before_chassis
         self.retry_visual_failures = bool(retry_visual_failures)
+        self._selected_source: SlotAddress | None = None
+        self._selected_destination: SlotAddress | None = None
 
-    def execute(self, command: TransferCommand) -> RackObservation:
+    @property
+    def selected_source(self) -> SlotAddress | None:
+        """The source selected for the most recent successful attempt."""
+
+        return self._selected_source
+
+    @property
+    def selected_destination(self) -> SlotAddress | None:
+        """The destination selected for the most recent successful attempt."""
+
+        return self._selected_destination
+
+    def execute(
+        self,
+        request: MobileTransferRequest | TransferCommand,
+    ) -> RackObservation:
         if not isinstance(self.program, MobileTransferProgram):
             raise WorkflowError("full mobile transfer requires a complete program")
-        self.program.require_command(command)
+        if isinstance(request, TransferCommand):
+            request = MobileTransferRequest(
+                source=request.source,
+                destination=request.destination,
+            )
+        if not isinstance(request, MobileTransferRequest):
+            raise WorkflowError("invalid mobile transfer request")
+        self.program.require_request(request)
+        self._selected_source = None
+        self._selected_destination = None
         workflow = self.runtime.workflow
-        self.pick_to_home(command.source)
+        if request.source is None:
+            source, _ = self.pick_detected_to_home(
+                on_source_selected=lambda selected: print(
+                    f"移动前自动选择源槽：{selected.text}",
+                    flush=True,
+                )
+            )
+        else:
+            source = request.source
+            self.pick_to_home(source)
+        self._selected_source = source
 
         if self.before_chassis is not None:
             move = self.program.chassis_move
@@ -150,20 +223,70 @@ class MobileTransferCoordinator:
             raise
 
         # base_right moved with the chassis.  Never reuse a rack_1 point here.
-        destination_preview = workflow.scan(command.destination.rack_id)
-        destination_latest = workflow.scan(command.destination.rack_id)
+        destination_preview = workflow.scan(self.program.destination_rack)
+        destination_latest = workflow.scan(self.program.destination_rack)
         workflow.verify_rack_unchanged(destination_preview, destination_latest)
-        workflow.place(command.destination, destination_latest)
-        self._record_fake("record_place", command.destination)
+        destination = request.destination
+        if destination is None:
+            destination = self.choose_empty_destination(destination_latest)
+            print(
+                f"移动后自动选择目标槽：{destination.text}",
+                flush=True,
+            )
+        self._selected_destination = destination
+        workflow.place(destination, destination_latest)
+        self._record_fake("record_place", destination)
 
         self._move_arm_to_loaded_observation(require_holding=False)
-        final = workflow.scan(command.destination.rack_id)
+        final = workflow.scan(self.program.destination_rack)
         workflow.verify_place_result(
             destination_latest,
-            command.destination,
+            destination,
             final,
         )
+        if self.program.return_to_start_after_transfer:
+            # The arm has already returned to loaded observation/home above.
+            # Do not issue any more arm commands while undoing the chassis move.
+            print(
+                "放置验证完成：右臂保持 loaded observation/home，"
+                "底盘开始反向返回起始位置。",
+                flush=True,
+            )
+            try:
+                self.chassis.return_to_start(self.program.chassis_move)
+            except Exception:
+                try:
+                    self.chassis.stop()
+                except Exception:
+                    pass
+                raise
         return final
+
+    def choose_empty_destination(
+        self,
+        observation: RackObservation,
+    ) -> SlotAddress:
+        """Choose a usable EMPTY slot from a stable destination observation."""
+
+        if observation.rack_id != self.program.destination_rack:
+            raise WorkflowError(
+                f"expected destination rack {self.program.destination_rack}, "
+                f"observed {observation.rack_id}"
+            )
+        candidates = sorted(
+            (
+                slot
+                for slot in observation.slots
+                if slot.occupancy is Occupancy.EMPTY
+                and slot.hole_on_plane_base is not None
+            ),
+            key=lambda slot: (slot.address.row, slot.address.column),
+        )
+        if not candidates:
+            raise WorkflowError(
+                f"no confirmed empty slot in {observation.rack_id}"
+            )
+        return candidates[0].address
 
     def pick_to_home(self, source: SlotAddress) -> RackObservation:
         """Pick one source tube, return home, and prove the source slot emptied."""
@@ -230,6 +353,13 @@ class MobileTransferCoordinator:
         self._record_fake("record_pick", source)
 
         self._move_arm_to_loaded_observation()
+        if not getattr(self.program, "verify_pick_after_home", True):
+            print(
+                "抓取后闭环复扫：按配置跳过；已回到 loaded observation/home，"
+                "后续流程将使用目标架重新识别。",
+                flush=True,
+            )
+            return source_latest
         while True:
             try:
                 source_after_pick = workflow.scan(source.rack_id)
@@ -299,6 +429,14 @@ def load_mobile_transfer_program(path: str | Path) -> MobileTransferProgram:
             chassis_move=move,
             rotate_helper_path=str(helpers["rotate_helper_path"]),
             pose_servo_path=str(helpers["pose_servo_path"]),
+            verify_pick_after_home=_strict_bool(
+                data.get("verify_pick_after_home", True),
+                "verify_pick_after_home",
+            ),
+            return_to_start_after_transfer=_strict_bool(
+                data.get("return_to_start_after_transfer", True),
+                "return_to_start_after_transfer",
+            ),
         )
     except (KeyError, TypeError, ValueError) as error:
         raise ConfigError(f"mobile transfer settings are invalid: {error}") from error
@@ -321,6 +459,10 @@ def load_mobile_pick_home_program(path: str | Path) -> MobilePickHomeProgram:
             loaded_observation_confirmed=_strict_bool(
                 pose_data.get("confirmed"),
                 "loaded_observation_pose.confirmed",
+            ),
+            verify_pick_after_home=_strict_bool(
+                data.get("verify_pick_after_home", True),
+                "verify_pick_after_home",
             ),
         )
     except (KeyError, TypeError, ValueError) as error:
@@ -368,6 +510,12 @@ def format_mobile_transfer_program(program: MobileTransferProgram) -> str:
             f"RPY=({pose.rx_rad:.4f}, {pose.ry_rad:.4f}, {pose.rz_rad:.4f}) rad",
             f"底盘：旋转 {move.rotation_deg:.1f} deg，随后沿自身 X "
             f"平移 {move.translation_x_m:.3f} m",
+            "放置后：右臂保持 loaded observation/home，"
+            + (
+                "底盘反向返回起始位置"
+                if program.return_to_start_after_transfer
+                else "不执行底盘回程"
+            ),
             "定位：目标站重新执行 D435 + screw/cap YOLO + 深度定位；"
             "不复用源站 base_right 坐标",
         )

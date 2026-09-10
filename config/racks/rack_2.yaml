@@ -1,0 +1,31 @@
+schema_version: 4
+landmark_source: screw_centers_v1
+rack_id: rack_2
+grid:
+  rows: 2
+  columns: 6
+keypoint_names:
+- k0
+- k1
+- k2
+- k3
+anchors:
+  first_slot: r1c1
+  last_slot: r2c6
+  first_slot_unit:
+  - 0.12934323105735449
+  - 0.25702566496864804
+  last_slot_unit:
+  - 0.8677166448822639
+  - 0.72771132671116679
+display_corners_unit:
+- - 0.0
+  - 0.0
+- - 1.0
+  - 0.0
+- - 1.0
+  - 1.0
+- - 0.0
+  - 1.0
+display_corners_calibrated: false
+calibrated_at_utc: '2026-09-10T12:43:56+00:00'

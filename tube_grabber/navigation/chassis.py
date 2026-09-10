@@ -57,12 +57,14 @@ class ChassisMove:
             raise ValueError("position tolerance must be between 0.005 and 0.05 m")
         if not 0.005 <= self.maximum_rotation_translation_m <= 0.10:
             raise ValueError("rotation translation guard must be 0.005..0.10 m")
-        if not 10.0 <= self.timeout_s <= 120.0:
-            raise ValueError("chassis timeout must be between 10 and 120 seconds")
+        if not 10.0 <= self.timeout_s <= 60.0:
+            raise ValueError("chassis timeout must be between 10 and 60 seconds")
 
 
 class ChassisPort(Protocol):
     def move_to_destination(self, move: ChassisMove) -> None: ...
+
+    def return_to_start(self, move: ChassisMove) -> None: ...
 
     def stop(self) -> None: ...
 
@@ -71,12 +73,18 @@ class FakeChassis:
     def __init__(self, *, fail: bool = False) -> None:
         self.fail = bool(fail)
         self.moves: list[ChassisMove] = []
+        self.return_moves: list[ChassisMove] = []
         self.stop_count = 0
 
     def move_to_destination(self, move: ChassisMove) -> None:
         self.moves.append(move)
         if self.fail:
             raise HardwareError("fake chassis move failed")
+
+    def return_to_start(self, move: ChassisMove) -> None:
+        self.return_moves.append(move)
+        if self.fail:
+            raise HardwareError("fake chassis return failed")
 
     def stop(self) -> None:
         self.stop_count += 1
@@ -149,6 +157,67 @@ class WooshHelperChassis:
                         _number(move.position_tolerance_m),
                         "--yaw-tolerance-rad",
                         _number(math.radians(move.yaw_tolerance_deg)),
+                        "--timeout-s",
+                        _number(move.timeout_s),
+                    ],
+                    move.timeout_s + 10.0,
+                )
+        except Exception:
+            try:
+                self.stop()
+            except Exception:
+                pass
+            raise
+
+    def return_to_start(self, move: ChassisMove) -> None:
+        """Undo the chassis route while leaving the arm at its home pose.
+
+        The forward route is rotation followed by translation in the rotated
+        body frame.  Its geometric inverse is therefore translation in the
+        current body frame first, followed by the two opposite half-turns.
+        """
+
+        self._require_helpers()
+        half_turn_rad = -math.radians(move.rotation_deg / 2.0)
+        try:
+            for translation in _translation_segments(
+                -move.translation_x_m,
+                self._MAX_TRANSLATION_SEGMENT_M,
+            ):
+                self._run(
+                    [
+                        self.pose_servo_path,
+                        "--dx-m",
+                        _number(translation),
+                        "--dy-m",
+                        "0",
+                        "--dyaw-rad",
+                        "0",
+                        "--max-linear-mps",
+                        _number(move.translation_speed_mps),
+                        "--max-angular-radps",
+                        _number(move.rotation_speed_radps),
+                        "--position-tolerance-m",
+                        _number(move.position_tolerance_m),
+                        "--yaw-tolerance-rad",
+                        _number(math.radians(move.yaw_tolerance_deg)),
+                        "--timeout-s",
+                        _number(move.timeout_s),
+                    ],
+                    move.timeout_s + 10.0,
+                )
+            for _ in range(2):
+                self._run(
+                    [
+                        self.rotate_helper_path,
+                        "--rotate-relative-rad",
+                        _number(half_turn_rad),
+                        "--max-angular-radps",
+                        _number(move.rotation_speed_radps),
+                        "--yaw-tolerance-rad",
+                        _number(math.radians(move.yaw_tolerance_deg)),
+                        "--max-translation-m",
+                        _number(move.maximum_rotation_translation_m),
                         "--timeout-s",
                         _number(move.timeout_s),
                     ],

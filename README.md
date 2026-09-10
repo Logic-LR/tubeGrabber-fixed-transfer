@@ -70,7 +70,8 @@ r1c1 / r2c6 双圆心标定 ─→ 2×6 网格 ─→ 槽位占用匹配
 | <code>app / cli</code> | 依赖组装、生命周期、人工确认和命令入口 |
 
 更详细的设计见 [架构说明](docs/ARCHITECTURE.md)。2026-09-09 的真机抓取参数、
-闭环结果和续接事项见 [实验日志](docs/LAB_LOG_2026-09-09.md)。
+闭环结果和续接事项见 [实验日志](docs/LAB_LOG_2026-09-09.md)，完整中文操作步骤见
+[右臂视觉抓管实验复现手册](docs/REPRODUCE_PICK_HOME_2026-09-09_CN.md)。
 
 ## 硬件与软件要求
 
@@ -354,16 +355,17 @@ python -m tube_grabber fixed-transfer
 
 ~~~bash
 python -m tube_grabber plan-mobile-transfer \
-  --source rack_1.r1c1 --destination rack_2.r1c2
+  --source rack_1.r1c1 --auto-destination
 python -m tube_grabber mobile-transfer \
-  --source rack_1.r1c1 --destination rack_2.r1c2
+  --source rack_1.r1c1 --auto-destination
 python -m tube_grabber mobile-pick-home --auto-source
 ~~~
 
 该流程抓取后先回带管 home，确认源槽为空，再让 Woosh 底盘闭环旋转 180 度并
-沿车体 X 平移实测距离。到达后重新识别 `rack_2`，不复用移动前的三维坐标；释放后
-再次复扫目标架。默认配置缺少距离 X、`rack_2` 标定且确认锁关闭，因此不能直接驱动
-真机。完整配置和验收步骤见 [双试管架移动闭环](docs/MOBILE_TRANSFER.md)。
+沿车体 X 平移实测距离。到达后重新识别 `rack_2`，不复用移动前的三维坐标，并从两次
+一致的稳定扫描中选择一个确认为空的槽位；释放后再次复扫目标架。也可以继续通过
+`--destination rack_2.r1c2` 指定固定目标。默认配置缺少距离 X、`rack_2` 标定且确认锁
+关闭，因此不能直接驱动真机。完整配置和验收步骤见 [双试管架移动闭环](docs/MOBILE_TRANSFER.md)。
 
 ## Agent 命令
 

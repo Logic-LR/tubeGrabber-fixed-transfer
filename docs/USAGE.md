@@ -578,6 +578,18 @@ Gemini 只提出一个结构化搬运命令，不直接获得机械臂、夹爪�
 `mobile-pick-home` 验证从 `rack_1` 抓取、保持夹紧并返回带管 home。该入口不会
 移动底盘，也不会释放试管。
 
+完整跨站任务可以让程序在移动后自动选择目标槽：
+
+```bash
+python -m tube_grabber mobile-transfer \
+  --source rack_1.r1c1 \
+  --auto-destination
+```
+
+程序会对目标架做两次稳定扫描，只从两次都确认为 `EMPTY` 且有架面坐标的槽位中选取
+一个目标；识别不一致或没有空槽时保持夹持并停止。也可以用 `--destination` 指定固定
+目标槽。
+
 ```text
 rack_1.* -> rack_2.*
 rack_2.* -> rack_1.*

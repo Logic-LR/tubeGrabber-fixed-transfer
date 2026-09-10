@@ -2,7 +2,7 @@
 
 `mobile-transfer` 用于以下固定布置：机器人从 `rack_1` 取管，右臂带管回到已
 确认的观察/运输 home，底盘旋转约 180 度并沿新的车体 X 方向平移实测距离，随后
-重新识别 `rack_2`、放置并复扫。
+重新识别 `rack_2`，从两次稳定扫描中选择一个确认为空的槽位、放置并复扫。
 
 这条流程不复用底盘移动前得到的三维目标。`base_right` 会随底盘移动，所有
 `rack_2` 放置坐标均由移动后的 D435、cap/screw YOLO、深度和平面拟合重新计算。
@@ -18,10 +18,12 @@
   -> 复扫 rack_1，确认源槽为空且其他槽未变化
   -> 两次约 90 度 Woosh 闭环旋转
   -> 沿车体 X 分段闭环平移总距离 X
-  -> 两次扫描 rack_2，确认目标为空且现场稳定
-  -> 使用 rack_2 最新三维坐标放置
+  -> 两次扫描 rack_2，确认现场稳定并筛选 EMPTY 槽位
+  -> 按 rack_2 最新三维坐标放入选定的空槽
   -> 回到 observation/home
   -> 最终复扫 rack_2，确认目标占用且其他槽未变化
+  -> 右臂保持 loaded observation/home
+  -> 底盘沿原路线反向返回机器人起始位置
 ```
 
 任何阶段失败都会停止后续阶段。夹紧命令发出后，软件保守地视为仍持管；底盘失败、
@@ -64,14 +66,29 @@ python -m tube_grabber transfer \
 ```bash
 python -m tube_grabber plan-mobile-transfer \
   --source rack_1.r1c1 \
-  --destination rack_2.r1c2
+  --auto-destination
 
 python -m tube_grabber mobile-transfer \
   --source rack_1.r1c1 \
-  --destination rack_2.r1c2
+  --auto-destination
 ```
 
 `plan-mobile-transfer` 只校验配置，不连接相机、机械臂、夹爪或底盘。
+`--auto-destination` 会在底盘移动完成后对目标架连续扫描两次，要求两次架面位置和
+12 个槽位状态一致，然后按 `r1c1` 到 `r2c6` 的顺序选择第一个同时具备架面坐标的
+`EMPTY` 槽位。`UNKNOWN`、状态不一致或没有可用空槽时，程序不会松爪。
+
+如果现场需要固定目标，也可以继续使用 `--destination rack_2.r1c2`；此时目标槽
+必须在移动后的扫描中确认仍为空。
+
+源架上只有一支试管时，完整任务也可以在同一个进程内自动选择源槽：
+
+    python -m tube_grabber mobile-transfer --auto-source --auto-destination
+
+机器人上的 tools/pick_rotate_forward.sh 使用这个入口：取管回 loaded home 后，
+立即执行底盘旋转/前移，随后重新识别 rack_2，按取管动作的反向顺序插管、释放、
+撤离并回到 home；目标架最终复扫确认成功后，右臂保持该 home 姿势，底盘再沿
+反向路线回到机器人起始位置，最后退出进程。夹爪状态和持管安全状态不会跨进程丢失。
 
 ## 必须完成的配置
 
@@ -84,6 +101,9 @@ python -m tube_grabber mobile-transfer \
    `loaded_observation_pose.confirmed: true` 和顶层 `confirmed: true`。
 5. 保持 `motion.parameters_confirmed: false`，直到机械臂、两架、底盘路径和周边
    障碍均在最终现场验收完毕。
+6. `return_to_start_after_transfer: true` 时，放置闭环验证成功且右臂回到
+   loaded observation/home 后，才会执行底盘反向回程；回程失败会停止并报告，不会
+   再移动右臂。
 
 只验证抓取回 home 时，完成第 3 项以及右臂完整低速路径检查后，才设置
 `pick_home_confirmed: true`。该锁不代表底盘路线已确认，不能替代顶层
@@ -101,5 +121,6 @@ Woosh 位姿/速度接口：
 位姿伺服器的局部运动范围。每个辅助程序必须在返回前重复发送零速度、验证最终误差
 并确认线速度和角速度归零；非零退出、超时或输出缺少最终位姿均视为失败。
 
-辅助程序路径在 `config/mobile_transfer.yaml` 中配置。默认路径只是机器人部署约定，
-仓库不会在 Windows 开发机上尝试连接底盘。
+辅助程序路径在 `config/mobile_transfer.yaml` 中配置，并固定放在
+`~/tubeGrabber-mobile-current/tools/agv_debug_tools/` 隔离目录内；仓库不会在
+Windows 开发机上尝试连接底盘。

@@ -38,6 +38,7 @@ from tube_grabber.fixed_transfer import (
 )
 from tube_grabber.mobile_transfer import (
     MobileTransferCoordinator,
+    MobileTransferRequest,
     build_mobile_chassis,
     format_mobile_pick_home_program,
     format_mobile_transfer_program,
@@ -75,18 +76,37 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
 
         if args.command in ("plan-mobile-transfer", "mobile-transfer"):
-            command = parse_transfer(args.source, args.destination)
-            _require_configured_transfer(config, command)
+            source = parse_slot(args.source) if args.source is not None else None
+            destination = (
+                parse_slot(args.destination)
+                if args.destination is not None
+                else None
+            )
+            request = MobileTransferRequest(
+                source=source,
+                destination=destination,
+                auto_source=bool(args.auto_source),
+                auto_destination=bool(args.auto_destination),
+            )
             program = load_mobile_transfer_program(
                 project_path(args.mobile_config)
             )
-            program.require_command(command)
+            _require_configured_rack(
+                config,
+                source.rack_id if source is not None else program.source_rack,
+            )
+            _require_configured_rack(config, program.destination_rack)
+            program.require_request(request)
             print(format_mobile_transfer_program(program))
+            if request.auto_source:
+                print("源槽：移动前稳定重扫，自动选择唯一确认为有管的槽位")
+            if request.auto_destination:
+                print("目标槽：移动后对目标架稳定重扫，自动选择确认为空的槽位")
             if args.command == "plan-mobile-transfer":
                 print("跨站流程配置校验：通过（未连接任何硬件）")
                 return 0
             runtime = build_runtime(config)
-            return _mobile_transfer(runtime, config, program, command)
+            return _mobile_transfer(runtime, config, program, request)
 
         if args.command in ("plan-mobile-pick-home", "mobile-pick-home"):
             program = load_mobile_pick_home_program(
@@ -211,7 +231,7 @@ def _parser() -> argparse.ArgumentParser:
         help="执行 rack_1 到 rack_2 的视觉闭环跨站抓放",
     )
     for mobile in (mobile_plan, mobile_execute):
-        _add_transfer_arguments(mobile)
+        _add_mobile_transfer_arguments(mobile)
         mobile.add_argument(
             "--mobile-config",
             default="config/mobile_transfer.yaml",
@@ -314,6 +334,26 @@ def _add_transfer_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--destination", required=True, help="例如 rack_1.r2c6")
 
 
+def _add_mobile_transfer_arguments(parser: argparse.ArgumentParser) -> None:
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--source", help="例如 rack_1.r1c1")
+    source.add_argument(
+        "--auto-source",
+        action="store_true",
+        help="移动前重扫源架，选择唯一确认为有管的槽位",
+    )
+    destination = parser.add_mutually_exclusive_group(required=True)
+    destination.add_argument(
+        "--destination",
+        help="固定目标槽，例如 rack_2.r1c2",
+    )
+    destination.add_argument(
+        "--auto-destination",
+        action="store_true",
+        help="移动后重扫目标架，选择首个稳定确认为空的槽位",
+    )
+
+
 def _fixed_transfer(
     config: dict[str, Any],
     *,
@@ -364,21 +404,13 @@ def _mobile_transfer(
     runtime: TubeGrabberRuntime,
     config: dict[str, Any],
     program: Any,
-    command: TransferCommand,
+    request: MobileTransferRequest,
 ) -> int:
     chassis = build_mobile_chassis(runtime.mode, program)
     if runtime.mode == "real":
+        # This command is the explicit operator authorization for the
+        # dedicated batch task.  Do not add a second interactive prompt here.
         program.require_real_confirmation()
-        if bool(config["runtime"].get("require_enter_before_motion", True)):
-            try:
-                answer = input(
-                    "确认机械臂空载、底盘路径清空、急停可触达；"
-                    "输入 MOBILE-RUN 执行双架搬运："
-                ).strip()
-            except EOFError as error:
-                raise WorkflowError("mobile authorization input is unavailable") from error
-            if answer != "MOBILE-RUN":
-                raise WorkflowError("operator did not authorize mobile transfer")
 
     runtime.start(
         need_arm=True,
@@ -386,30 +418,38 @@ def _mobile_transfer(
         need_gripper=True,
     )
     try:
+        if runtime.mode == "real":
+            cleared = runtime.arm.clear_joint_errors()  # type: ignore[attr-defined]
+            for joint_num, error_code in cleared:
+                print(f"已清除第 {joint_num} 关节错误 0x{error_code:04X}")
         runtime.require_motion_ready()
-        if runtime.mode == "real" and bool(
-            config["motion"].get("confirm_each_step", False)
-        ):
-            runtime.workflow.set_step_confirmation(_confirm_transfer_step)
         runtime.move_to_observation_pose()
         coordinator = MobileTransferCoordinator(
             runtime=runtime,
             chassis=chassis,
             program=program,
-            before_chassis=(
-                _confirm_transfer_step
-                if runtime.mode == "real"
-                and bool(config["motion"].get("confirm_each_step", False))
-                else None
+            retry_visual_failures=(
+                runtime.mode == "real" and request.auto_source
             ),
         )
-        final = coordinator.execute(command)
+        final = coordinator.execute(request)
+        source = coordinator.selected_source or request.source
+        if source is None:
+            raise WorkflowError("mobile transfer completed without a source")
+        destination = coordinator.selected_destination
+        if destination is None:
+            raise WorkflowError("mobile transfer completed without a destination")
         print("目标架最终闭环复扫：")
         print(format_observation(final))
         _save_scan_if_available(runtime, config)
         print(
-            f"跨站搬运完成：{command.source.text} -> "
-            f"{command.destination.text}；机械臂已回 loaded observation/home"
+            f"跨站搬运完成：{source.text} -> "
+            f"{destination.text}；机械臂保持 loaded observation/home，"
+            + (
+                "底盘已回机器人起始位置"
+                if program.return_to_start_after_transfer
+                else "底盘未执行回程"
+            )
         )
         return 0
     except BaseException:
@@ -437,16 +477,6 @@ def _mobile_pick_home(
 ) -> int:
     if runtime.mode == "real":
         program.require_real_confirmation()
-        if bool(config["runtime"].get("require_enter_before_motion", True)):
-            try:
-                answer = input(
-                    "确认右臂位于空载 home、源试管架正确、机械臂路径无人无障碍、"
-                    "急停可触达；输入 PICK-HOME 执行抓取并带管回 home："
-                ).strip()
-            except EOFError as error:
-                raise WorkflowError("pick-home authorization input is unavailable") from error
-            if answer != "PICK-HOME":
-                raise WorkflowError("operator did not authorize mobile pick-home")
 
     runtime.start(
         need_arm=True,
@@ -478,13 +508,20 @@ def _mobile_pick_home(
             )
         else:
             final = coordinator.pick_to_home(source)
-        print("源架抓取后闭环复扫：")
-        print(format_observation(final))
-        _save_scan_if_available(runtime, config)
-        print(
-            f"抓取回 home 完成：{source.text} 已确认空；"
-            "机械臂位于 loaded observation/home，夹爪保持夹紧。"
-        )
+        if program.verify_pick_after_home:
+            print("源架抓取后闭环复扫：")
+            print(format_observation(final))
+            _save_scan_if_available(runtime, config)
+            print(
+                f"抓取回 home 完成：{source.text} 已确认空；"
+                "机械臂位于 loaded observation/home，夹爪保持夹紧。"
+            )
+        else:
+            print(
+                f"抓取回 home 完成：{source.text}；"
+                "已按配置跳过源架复扫，机械臂位于 loaded observation/home，"
+                "夹爪保持夹紧。后续任务将重新识别目标架。"
+            )
         return 0
     except BaseException:
         _stop_quietly(runtime)

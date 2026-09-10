@@ -182,6 +182,7 @@ motion:
   verify_reached_each_waypoint: false
   position_reached_tolerance_mm: 4.0
   orientation_reached_tolerance_deg: 0.5
-  # r1c1 retreat reached X=-53.14 mm; keep margin around that measured path.
-  workspace_min_mm: [-80.0, 270.0, -110.0]
+  # The right-arm rack target observed at Y=263.4 mm was just below the old
+  # lower gate. Keep a 13.4 mm margin while leaving X/Z limits unchanged.
+  workspace_min_mm: [-80.0, 250.0, -110.0]
   workspace_max_mm: [250.0, 435.0, 200.0]
